@@ -37,7 +37,7 @@ async def run(url):
         def __init__(self, *args):
             pass
 
-        async def reply(self, text):
+        async def reply(self, text, **kwargs):
             yield "offline reply"
 
     async def silent_tts(text):
@@ -88,13 +88,16 @@ async def run(url):
         async def state(name):
             return await wait_for("/health", lambda data: data["state"] == name)
 
-        async def button():
+        async def button(key=0):
             nonlocal last_button
             await asyncio.sleep(max(0, last_button + 0.6 - time.monotonic()))
             count = (await get("/health"))["button_presses"]
-            response = await client.post("/api/button")
+            response = await client.post(f"/api/button?key={key}")
             response.raise_for_status()
-            await wait_for("/health", lambda data: data["button_presses"] == count + 1, 3)
+            if key == 0:
+                await wait_for("/health", lambda data: data["button_presses"] == count + 1, 3)
+            else:
+                await asyncio.sleep(0.15)
             last_button = time.monotonic()
 
         async def turn(interrupt=False):
@@ -155,10 +158,44 @@ async def run(url):
             assert failed["last_error"] == "no_speech" and failed["reply_stage"] == "error"
             failure = False
             await turn()  # Diagnostic error is retained until the next turn starts.
+            # New product activity path: K1 chooses a theme, K2 joins/ends, K0 still talks.
+            await button(1)
+            await button(2)
+            activity = await wait_for("/api/activity", lambda data: data["state"] == "active")
+            assert activity["theme"] == "film"
+            assert not activity["camera_enabled"] and not activity["hints_enabled"]
+            await turn()
+            await wait_for("/api/activity", lambda data: data["history_turns"] == 1)
+            await turn(interrupt=True)
+            activity = await get("/api/activity")
+            assert activity["state"] == "active" and activity["history_turns"] == 2
+            response = await client.post("/api/activity", json={"action": "pause"})
+            response.raise_for_status()
+            await state("paused")
+            await button()
+            assert not (await get("/health"))["capture_requested"]
+            response = await client.post("/api/activity", json={"action": "resume"})
+            response.raise_for_status()
+            await state("idle")
+            await turn()
+            await wait_for("/api/activity", lambda data: data["history_turns"] == 3)
+            await button(2)
+            ended = await wait_for("/api/activity", lambda data: data["state"] == "ended")
+            assert ended["history_turns"] == 0
+            await button()
+            assert not (await get("/health"))["capture_requested"]
+            assert (await client.post("/api/activity", json={"action": "start"})).status_code == 400
+            await button(2)
+            joined = await wait_for("/api/activity", lambda data: data["state"] == "active")
+            assert joined["history_turns"] == 0
+            await turn()
+            await button(2)
+            await wait_for("/api/activity", lambda data: data["state"] == "ended")
             stats = await get("/api/stats")
-            print(json.dumps({"result": "PASS", "turns": 8, "completed": 6,
-                              "interrupted": 1, "reconnects": accepted - 1,
+            print(json.dumps({"result": "PASS", "turns": 12, "completed": 9,
+                              "interrupted": 2, "reconnects": accepted - 1,
                               "expected_errors": 1,
+                              "activity_flow": "join/theme/history/interrupt/pause/resume/end/clear/rejoin",
                               "frames_rx": stats["frames_rx"],
                               "decode_failures": stats["decode_failures"],
                               "play_failures": stats["play_failures"]}))

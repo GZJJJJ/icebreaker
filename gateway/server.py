@@ -15,6 +15,7 @@ from typing import Any
 from websockets.asyncio.server import ServerConnection, serve
 
 from providers import SiliconFlowAsrProvider, SiliconFlowLlmProvider, synthesize_with_fallback
+from activity import Activity
 
 LOG = logging.getLogger("icebreaker.gateway")
 REPLY_TIMEOUT_SECONDS = 120
@@ -48,6 +49,7 @@ class Session:
     reply_task: asyncio.Task | None = None
     mock: bool = True
     turn: int = 0
+    activity: Activity = field(default_factory=Activity)
 
 
 async def send_json(ws: ServerConnection, event: str, **payload: Any) -> None:
@@ -104,9 +106,15 @@ async def run_reply(ws: ServerConnection, session: Session, pcm: bytes) -> None:
                 await send_json(ws, "llm.delta", text=response)
             else:
                 response = ""
-                async for delta in SiliconFlowLlmProvider(
+                provider = SiliconFlowLlmProvider(
                     load_api_key(), os.getenv("SILICONFLOW_MODEL", "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B")
-                ).reply(recognized):
+                )
+                if session.activity.state == "active":
+                    reply = provider.reply(recognized, history=list(session.activity.history),
+                                           context=session.activity.context())
+                else:
+                    reply = provider.reply(recognized)
+                async for delta in reply:
                     if delta.strip() and "llm_first" not in timings:
                         timings["llm_first"] = round((time.perf_counter() - stage_started) * 1000)
                     response += delta
@@ -138,6 +146,9 @@ async def run_reply(ws: ServerConnection, session: Session, pcm: bytes) -> None:
                 await asyncio.sleep(0)  # Allow control messages to cancel a long reply.
             await send_json(ws, "tts.end")
             timings["send"] = round((time.perf_counter() - stage_started) * 1000)
+            if session.activity.state == "active":
+                session.activity.remember(recognized, response)
+                await send_json(ws, "activity.state", **session.activity.snapshot())
     except asyncio.CancelledError:
         outcome = "cancelled"
         raise
@@ -190,7 +201,36 @@ async def handle_message(ws: ServerConnection, session: Session, message: str | 
         return
 
     event = request.get("event")
-    if event == "session.start":
+    if event == "activity.start":
+        try:
+            activity = Activity.from_request(request)
+        except ValueError as exc:
+            await send_json(ws, "activity.error", code=str(exc))
+            return
+        await cancel_reply(session)
+        session.activity.end()
+        session.activity = activity
+        session.state = "idle"
+        await send_json(ws, "activity.state", **activity.snapshot())
+    elif event in {"activity.pause", "activity.resume", "activity.end", "activity.get"}:
+        if event == "activity.get":
+            await send_json(ws, "activity.state", **session.activity.snapshot())
+            return
+        expected = "paused" if event == "activity.resume" else "active"
+        if event != "activity.end" and session.activity.state != expected:
+            await send_json(ws, "activity.error", code="invalid_activity_state")
+            return
+        await cancel_reply(session)
+        if event == "activity.end":
+            session.activity.end()
+        else:
+            session.activity.state = "paused" if event == "activity.pause" else "active"
+        session.state = "idle"
+        await send_json(ws, "activity.state", **session.activity.snapshot())
+    elif event == "session.start":
+        if session.activity.state in {"paused", "ended"}:
+            await send_json(ws, "activity.error", code="activity_not_active")
+            return
         cancel_ms = await cancel_reply(session)
         session.turn += 1
         session.state = "listening"
@@ -228,6 +268,7 @@ async def handle_message(ws: ServerConnection, session: Session, message: str | 
         await send_json(ws, "session.state", state=session.state, cancel_ms=cancel_ms)
     elif event == "session.end":
         await cancel_reply(session)
+        session.activity.end()
         session.state = "ended"
         await send_json(ws, "session.state", state=session.state)
     else:
@@ -243,6 +284,7 @@ async def connection_handler(ws: ServerConnection) -> None:
             await handle_message(ws, session, message)
     finally:
         await cancel_reply(session)
+        session.activity.end()
 
 
 async def run(host: str, port: int) -> None:

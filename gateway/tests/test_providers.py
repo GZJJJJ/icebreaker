@@ -36,3 +36,22 @@ async def test_llm_keeps_selected_model_and_reads_only_spoken_content(monkeypatc
     assert [delta async for delta in model.reply("请只回答一加一等于几")] == ["2"]
     assert "first_content_ms=" in caplog.text and "reasoning_chars=" in caplog.text
     assert "private-reasoning-canary" not in caplog.text and "secret-key-canary" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_llm_adds_context_and_history_before_current_input(monkeypatch):
+    original_client = httpx.AsyncClient
+    history = [{"role": "user", "content": "我喜欢旅行"},
+               {"role": "assistant", "content": "想去哪座城市？"}]
+
+    def respond(request):
+        messages = json.loads(request.content)["messages"]
+        assert messages[0] == {"role": "system", "content": providers.SYSTEM_PROMPT + "\n旅行主题"}
+        assert messages[1:3] == history
+        assert messages[-1] == {"role": "user", "content": "刚才聊的是什么？"}
+        return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"旅行"}}]}\n\ndata: [DONE]\n\n')
+
+    monkeypatch.setattr(providers.httpx, "AsyncClient",
+                        lambda **kw: original_client(transport=httpx.MockTransport(respond), **kw))
+    model = providers.SiliconFlowLlmProvider("offline", "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B")
+    assert [part async for part in model.reply("刚才聊的是什么？", history=history, context="旅行主题")] == ["旅行"]

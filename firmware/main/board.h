@@ -6,7 +6,8 @@
 #include "esp_err.h"
 
 esp_err_t board_init(void);
-esp_err_t board_display_status(const char *status);
+esp_err_t board_display_status(const char *status, const char *theme);
+esp_err_t board_read_activity_buttons(uint8_t *buttons);
 void board_stop_audio(void);
 esp_err_t board_start_audio(void);
 esp_err_t board_mic_probe(void);

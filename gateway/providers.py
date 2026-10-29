@@ -58,7 +58,8 @@ class SiliconFlowLlmProvider:
         self.api_key = api_key
         self.model = model
 
-    async def reply(self, text: str) -> AsyncIterator[str]:
+    async def reply(self, text: str, *, history: list[dict[str, str]] | None = None,
+                    context: str = "") -> AsyncIterator[str]:
         if not self.api_key or not self.model:
             raise RuntimeError("SILICONFLOW_API_KEY and SILICONFLOW_MODEL are required")
         started = time.perf_counter()
@@ -76,7 +77,8 @@ class SiliconFlowLlmProvider:
                     "stream": True,
                     "max_tokens": 160,
                     "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "system", "content": SYSTEM_PROMPT + ("\n" + context if context else "")},
+                        *(history or []),
                         {"role": "user", "content": text},
                     ],
                 },

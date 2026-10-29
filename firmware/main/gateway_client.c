@@ -19,6 +19,12 @@ static const char *TAG = "gateway";
 static esp_websocket_client_handle_t s_client;
 static atomic_bool s_connected;
 static atomic_bool s_upload_enabled;
+static atomic_int s_activity_state = ACTIVITY_NONE;
+static atomic_bool s_activity_pending;
+static atomic_int s_activity_theme;
+static const char *THEMES[] = {"travel", "film", "reading", "general"};
+static const char *s_activity_scene = "social";
+static unsigned s_history_turns;
 static SemaphoreHandle_t s_gate;
 static void (*s_callback)(gateway_event_t event);
 static unsigned s_turn;
@@ -162,6 +168,7 @@ static void notify(gateway_event_t event)
 
 static void fail_reply(void)
 {
+    s_activity_pending = false;
     const bool wait_metrics = s_wait_metrics;
     cancel_locked();
     s_wait_metrics = wait_metrics;
@@ -178,8 +185,45 @@ static void handle_json(cJSON *root)
         return;
     }
     if (strcmp(name->valuestring, "gateway.ready") == 0) {
+        s_activity_state = ACTIVITY_NONE;
+        s_activity_pending = false;
+        s_history_turns = 0;
         s_reply_stage = "idle";
         notify(GATEWAY_READY);
+        return;
+    }
+    if (strcmp(name->valuestring, "activity.state") == 0 && cJSON_IsString(state)) {
+        const char *states[] = {"none", "active", "paused", "ended"};
+        for (int i = 0; i < 4; ++i) {
+            if (strcmp(state->valuestring, states[i]) == 0) {
+                s_activity_state = i;
+                break;
+            }
+        }
+        const cJSON *theme = cJSON_GetObjectItemCaseSensitive(root, "theme");
+        if (cJSON_IsString(theme)) {
+            for (int i = 0; i < 4; ++i) {
+                if (strcmp(theme->valuestring, THEMES[i]) == 0) s_activity_theme = i;
+            }
+        }
+        const cJSON *scene = cJSON_GetObjectItemCaseSensitive(root, "scene");
+        const char *scenes[] = {"social", "date", "meeting"};
+        if (cJSON_IsString(scene)) {
+            for (int i = 0; i < 3; ++i) {
+                if (strcmp(scene->valuestring, scenes[i]) == 0) s_activity_scene = scenes[i];
+            }
+        }
+        const cJSON *history = cJSON_GetObjectItemCaseSensitive(root, "history_turns");
+        s_history_turns = cJSON_IsNumber(history) && history->valueint >= 0 ? history->valueint : 0;
+        s_activity_pending = false;
+        s_reply_stage = "idle";
+        notify(GATEWAY_ACTIVITY_CHANGED);
+        return;
+    }
+    if (strcmp(name->valuestring, "activity.error") == 0) {
+        s_activity_pending = false;
+        strlcpy(s_last_error, "activity_rejected", sizeof(s_last_error));
+        fail_reply();
         return;
     }
     if (strcmp(name->valuestring, "session.state") == 0 && cJSON_IsString(state)) {
@@ -233,9 +277,9 @@ static void handle_json(cJSON *root)
             }
         }
     } else if (strcmp(name->valuestring, "asr.final") == 0 && cJSON_IsString(text)) {
-        ESP_LOGI(TAG, "ASR: %s", text->valuestring);
+        ESP_LOGI(TAG, "ASR received: %u bytes", (unsigned)strlen(text->valuestring));
     } else if (strcmp(name->valuestring, "llm.delta") == 0 && cJSON_IsString(text)) {
-        ESP_LOGI(TAG, "LLM: %s", text->valuestring);
+        ESP_LOGD(TAG, "LLM delta: %u bytes", (unsigned)strlen(text->valuestring));
     } else if (strcmp(name->valuestring, "tts.start") == 0) {
         const cJSON *rate = cJSON_GetObjectItemCaseSensitive(root, "sample_rate");
         const cJSON *format = cJSON_GetObjectItemCaseSensitive(root, "format");
@@ -282,6 +326,7 @@ static void handle_json(cJSON *root)
             s_reply_stage = "ready";
         }
     } else if (strcmp(name->valuestring, "error") == 0) {
+        s_activity_pending = false;
         const cJSON *code = cJSON_GetObjectItemCaseSensitive(root, "code");
         // Store only a restricted diagnostic token, never arbitrary server text.
         const char *value = cJSON_IsString(code) ? code->valuestring : "gateway_error";
@@ -312,6 +357,9 @@ static void gateway_event_handler(void *arg, esp_event_base_t event_base,
     }
     if (event_id == WEBSOCKET_EVENT_DISCONNECTED || event_id == WEBSOCKET_EVENT_CLOSED) {
         s_connected = false;
+        s_activity_state = ACTIVITY_NONE;
+        s_activity_pending = false;
+        s_history_turns = 0;
         gateway_client_cancel();
         notify(GATEWAY_DISCONNECTED);
         ESP_LOGW(TAG, "disconnected; client will reconnect");
@@ -400,7 +448,8 @@ esp_err_t gateway_client_start(void (*callback)(gateway_event_t event))
 
 esp_err_t gateway_client_begin_turn(void)
 {
-    if (!s_connected || audio_player_busy()) {
+    if (!s_connected || audio_player_busy() || s_activity_pending ||
+        s_activity_state == ACTIVITY_PAUSED || s_activity_state == ACTIVITY_ENDED) {
         return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(s_gate, portMAX_DELAY);
@@ -423,6 +472,48 @@ esp_err_t gateway_client_begin_turn(void)
     if (result != ESP_OK) {
         gateway_client_cancel();
     }
+    return result;
+}
+
+activity_state_t gateway_client_activity_state(void) { return s_activity_state; }
+bool gateway_client_activity_pending(void) { return s_activity_pending; }
+const char *gateway_client_activity_theme(void) { return THEMES[s_activity_theme]; }
+
+int gateway_client_activity_stats(char *buffer, size_t size)
+{
+    const char *states[] = {"none", "active", "paused", "ended"};
+    xSemaphoreTake(s_gate, portMAX_DELAY);
+    const int length = snprintf(buffer, size,
+        "{\"state\":\"%s\",\"pending\":%s,\"scene\":\"%s\",\"theme\":\"%s\","
+        "\"history_turns\":%u,\"camera_enabled\":false,\"hints_enabled\":false}\n",
+        states[s_activity_state], s_activity_pending ? "true" : "false", s_activity_scene,
+        THEMES[s_activity_theme], s_history_turns);
+    xSemaphoreGive(s_gate);
+    return length;
+}
+
+esp_err_t gateway_client_activity(const char *action, const char *scene, const char *theme)
+{
+    if (!s_connected || action == NULL || s_activity_pending) return ESP_ERR_INVALID_STATE;
+    char request[224];
+    if (strcmp(action, "start") == 0) {
+        if (scene == NULL || theme == NULL) return ESP_ERR_INVALID_ARG;
+        if (strcmp(scene, "social") != 0 && strcmp(scene, "date") != 0 && strcmp(scene, "meeting") != 0)
+            return ESP_ERR_INVALID_ARG;
+        bool valid = false;
+        for (int i = 0; i < 4; ++i) valid |= strcmp(theme, THEMES[i]) == 0;
+        if (!valid) return ESP_ERR_INVALID_ARG;
+        snprintf(request, sizeof(request),
+            "{\"event\":\"activity.start\",\"consent\":true,\"scene\":\"%s\",\"theme\":\"%s\"}",
+            scene, theme);
+    } else if (strcmp(action, "pause") == 0 || strcmp(action, "resume") == 0 || strcmp(action, "end") == 0) {
+        snprintf(request, sizeof(request), "{\"event\":\"activity.%s\"}", action);
+    } else {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_activity_pending = true;
+    const esp_err_t result = gateway_client_send_event(request);
+    if (result != ESP_OK) s_activity_pending = false;
     return result;
 }
 

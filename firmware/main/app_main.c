@@ -22,6 +22,7 @@
 #include "board.h"
 #include "audio_player.h"
 #include "gateway_client.h"
+#include "cJSON.h"
 
 static const char *TAG = "icebreaker";
 
@@ -34,6 +35,7 @@ typedef enum {
     APP_STATE_SPEAKING,
     APP_STATE_INTERRUPTED,
     APP_STATE_ERROR,
+    APP_STATE_PAUSED,
 } app_state_t;
 
 static atomic_int s_state = APP_STATE_BOOT;
@@ -45,6 +47,8 @@ static atomic_bool s_capture_requested;
 static atomic_bool s_capture_active;
 static atomic_bool s_capture_cancelled;
 static atomic_uint s_button_presses;
+static atomic_uint s_selected_theme;
+static const char *THEMES[] = {"travel", "film", "reading", "general"};
 
 static const char *state_name(app_state_t state)
 {
@@ -57,6 +61,7 @@ static const char *state_name(app_state_t state)
     case APP_STATE_SPEAKING: return "speaking";
     case APP_STATE_INTERRUPTED: return "interrupted";
     case APP_STATE_ERROR: return "error";
+    case APP_STATE_PAUSED: return "paused";
     default: return "unknown";
     }
 }
@@ -69,7 +74,7 @@ static void set_state(app_state_t state)
     }
 
     ESP_LOGI(TAG, "state: %s -> %s", state_name(previous), state_name(state));
-    board_display_status(state_name(state));
+    board_display_status(state_name(state), THEMES[s_selected_theme]);
 }
 
 static void player_event(audio_player_event_t event)
@@ -86,7 +91,16 @@ static void player_event(audio_player_event_t event)
 
 static void gateway_event(gateway_event_t event)
 {
-    if (event == GATEWAY_READY) {
+    if (event == GATEWAY_ACTIVITY_CHANGED) {
+        const char *theme = gateway_client_activity_theme();
+        for (unsigned i = 0; i < 4; ++i) {
+            if (strcmp(theme, THEMES[i]) == 0) s_selected_theme = i;
+        }
+        if (!s_capture_active && !audio_player_busy()) {
+            set_state(gateway_client_activity_state() == ACTIVITY_PAUSED ? APP_STATE_PAUSED : APP_STATE_IDLE);
+            board_display_status(state_name(s_state), THEMES[s_selected_theme]);
+        }
+    } else if (event == GATEWAY_READY) {
         if (!s_capture_active && !audio_player_busy()) {
             set_state(APP_STATE_IDLE);
         }
@@ -117,6 +131,17 @@ static void stop_audio(void)
     gateway_client_send_event("{\"event\":\"session.interrupt\"}");
 
     ESP_LOGI(TAG, "audio stopped locally at %lld us", requested_at);
+}
+
+static esp_err_t activity_command(const char *action, const char *scene, const char *theme)
+{
+    if (gateway_client_activity_pending()) return ESP_ERR_INVALID_STATE;
+    if (strcmp(action, "start") == 0 && (s_capture_active || audio_player_busy()))
+        return ESP_ERR_INVALID_STATE;
+    if (strcmp(action, "pause") == 0 || strcmp(action, "end") == 0) {
+        stop_audio();
+    }
+    return gateway_client_activity(action, scene, theme);
 }
 
 static void capture_task(void *arg)
@@ -199,17 +224,31 @@ static void IRAM_ATTR button_isr(void *arg)
 static void button_task(void *arg)
 {
     uint32_t event;
-    TickType_t last_trigger = 0;
+    TickType_t last_trigger[4] = {0};
     while (xQueueReceive(s_button_events, &event, portMAX_DELAY) == pdTRUE) {
-        (void)event;
+        if (event < 1 || event > 3) continue;
         vTaskDelay(pdMS_TO_TICKS(40));
-        while (xQueueReceive(s_button_events, &event, 0) == pdTRUE) {
-        }
         const TickType_t now = xTaskGetTickCount();
-        if (last_trigger != 0 && (now - last_trigger) < pdMS_TO_TICKS(500)) {
+        if (last_trigger[event] != 0 && (now - last_trigger[event]) < pdMS_TO_TICKS(500)) {
             continue;
         }
-        last_trigger = now;
+        last_trigger[event] = now;
+        if (event == 2) {
+            const activity_state_t activity = gateway_client_activity_state();
+            if (!gateway_client_activity_pending() && activity != ACTIVITY_ACTIVE &&
+                activity != ACTIVITY_PAUSED && !s_capture_active && !audio_player_busy()) {
+                s_selected_theme = (s_selected_theme + 1) % 4;
+                board_display_status(state_name(s_state), THEMES[s_selected_theme]);
+            }
+            continue;
+        }
+        if (event == 3) {
+            const activity_state_t activity = gateway_client_activity_state();
+            const char *action = activity == ACTIVITY_ACTIVE || activity == ACTIVITY_PAUSED ? "end" : "start";
+            if (activity_command(action, "social", THEMES[s_selected_theme]) != ESP_OK)
+                ESP_LOGW(TAG, "activity command unavailable");
+            continue;
+        }
         s_button_presses++;
         ESP_LOGI(TAG, "button pressed: state=%s capture=%s",
                  state_name(s_state), s_capture_requested ? "on" : "off");
@@ -233,6 +272,25 @@ static void button_task(void *arg)
             ESP_LOGI(TAG, "capture started");
             set_state(APP_STATE_LISTENING);
         }
+    }
+}
+
+static void activity_buttons_task(void *arg)
+{
+    uint8_t previous = 0;
+    while (true) {
+        uint8_t buttons = 0;
+        if (board_read_activity_buttons(&buttons) == ESP_OK) {
+            const uint8_t pressed = buttons & (uint8_t)~previous;
+            for (uint32_t key = 1; key <= 2; ++key) {
+                if ((pressed & (1u << key)) != 0) {
+                    const uint32_t event = key + 1;
+                    xQueueSend(s_button_events, &event, 0);
+                }
+            }
+            previous = buttons;
+        }
+        vTaskDelay(pdMS_TO_TICKS(30));
     }
 }
 
@@ -261,6 +319,7 @@ static esp_err_t button_init(void)
 
     xTaskCreate(button_task, "button_task", 3072, NULL, 10, NULL);
     xTaskCreate(capture_task, "capture_task", 4096, NULL, 8, NULL);
+    xTaskCreate(activity_buttons_task, "activity_keys", 3072, NULL, 5, NULL);
     return ESP_OK;
 }
 
@@ -282,12 +341,55 @@ static esp_err_t health_handler(httpd_req_t *request)
 static esp_err_t button_handler(httpd_req_t *request)
 {
     // Trusted-LAN diagnostic: exercise exactly the same queue/task as GPIO K0.
-    const uint32_t event = 1;
+    uint32_t event = 1;
+    char query[32], key[4];
+    if (httpd_req_get_url_query_str(request, query, sizeof(query)) == ESP_OK &&
+        httpd_query_key_value(query, "key", key, sizeof(key)) == ESP_OK) {
+        if (strcmp(key, "0") == 0) event = 1;
+        else if (strcmp(key, "1") == 0) event = 2;
+        else if (strcmp(key, "2") == 0) event = 3;
+        else return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid key");
+    }
     if (xQueueSend(s_button_events, &event, 0) != pdTRUE) {
         return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Button queue full");
     }
     httpd_resp_set_type(request, "application/json");
     return httpd_resp_sendstr(request, "{\"ok\":true,\"queued\":true}\n");
+}
+
+static esp_err_t activity_handler(httpd_req_t *request)
+{
+    httpd_resp_set_type(request, "application/json");
+    if (request->method == HTTP_GET) {
+        char response[320];
+        const int length = gateway_client_activity_stats(response, sizeof(response));
+        return httpd_resp_send(request, response, length);
+    }
+    if (request->content_len <= 0 || request->content_len >= 256)
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid activity request");
+    char body[256];
+    size_t received = 0;
+    while (received < request->content_len) {
+        const int count = httpd_req_recv(request, body + received, request->content_len - received);
+        if (count <= 0) return ESP_FAIL;
+        received += count;
+    }
+    body[received] = '\0';
+    cJSON *root = cJSON_Parse(body);
+    const cJSON *action = cJSON_GetObjectItemCaseSensitive(root, "action");
+    const cJSON *scene = cJSON_GetObjectItemCaseSensitive(root, "scene");
+    const cJSON *theme = cJSON_GetObjectItemCaseSensitive(root, "theme");
+    const cJSON *consent = cJSON_GetObjectItemCaseSensitive(root, "consent");
+    esp_err_t result = ESP_ERR_INVALID_ARG;
+    if (cJSON_IsString(action) && (strcmp(action->valuestring, "start") != 0 || cJSON_IsTrue(consent))) {
+        result = activity_command(action->valuestring,
+            cJSON_IsString(scene) ? scene->valuestring : "social",
+            cJSON_IsString(theme) ? theme->valuestring : THEMES[s_selected_theme]);
+    }
+    cJSON_Delete(root);
+    if (result != ESP_OK)
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid consent, selection, or device busy");
+    return httpd_resp_sendstr(request, "{\"ok\":true,\"pending\":true}\n");
 }
 
 static esp_err_t interrupt_handler(httpd_req_t *request)
@@ -406,6 +508,10 @@ static esp_err_t http_server_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &tone_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &stats_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &play_uri));
+    const httpd_uri_t activity_get_uri = {.uri = "/api/activity", .method = HTTP_GET, .handler = activity_handler};
+    const httpd_uri_t activity_post_uri = {.uri = "/api/activity", .method = HTTP_POST, .handler = activity_handler};
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &activity_get_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &activity_post_uri));
     ESP_LOGI(TAG, "HTTP server listening on port %d", CONFIG_ICEBREAKER_HTTP_PORT);
     return ESP_OK;
 }
@@ -499,7 +605,7 @@ void app_main(void)
     ESP_ERROR_CHECK(nvs_result);
 
     ESP_ERROR_CHECK(board_init());
-    board_display_status("boot");
+    board_display_status("boot", THEMES[s_selected_theme]);
     board_mic_probe();
     ESP_ERROR_CHECK(audio_player_init(player_event));
     ESP_ERROR_CHECK(button_init());

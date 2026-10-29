@@ -56,7 +56,9 @@ static i2s_chan_handle_t s_i2s_rx;
 static esp_lcd_panel_handle_t s_lcd_panel;
 static esp_codec_dev_handle_t s_codec;
 static SemaphoreHandle_t s_lcd_mutex;
+static SemaphoreHandle_t s_lcd_done;
 static uint16_t *s_lcd_frame;
+static bool s_lcd_failed;
 
 enum {
     LCD_WIDTH = 320,
@@ -101,6 +103,7 @@ static const uint8_t *font_glyph(char character)
     };
     static const uint8_t zero[7] = {0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e};
     static const uint8_t one[7] = {0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e};
+    static const uint8_t two[7] = {0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f};
     if (character >= 'A' && character <= 'Z') {
         return glyphs[(unsigned)(character - 'A')];
     }
@@ -110,6 +113,7 @@ static const uint8_t *font_glyph(char character)
     if (character == '1') {
         return one;
     }
+    if (character == '2') return two;
     return NULL;
 }
 
@@ -229,6 +233,14 @@ static esp_err_t xl9555_init(void)
     return ESP_OK;
 }
 
+static bool lcd_transfer_done(esp_lcd_panel_io_handle_t panel_io,
+                              esp_lcd_panel_io_event_data_t *event, void *context)
+{
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(s_lcd_done, &woken);
+    return woken == pdTRUE;
+}
+
 static esp_err_t lcd_init(void)
 {
     gpio_config_t rd_config = {
@@ -267,6 +279,7 @@ static esp_err_t lcd_init(void)
         .flags = {
             .swap_color_bytes = 0,
         },
+        .on_color_trans_done = lcd_transfer_done,
     };
     esp_lcd_panel_io_handle_t panel_io;
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_i80(i80_bus, &io_config, &panel_io), TAG,
@@ -276,6 +289,7 @@ static esp_err_t lcd_init(void)
         .reset_gpio_num = GPIO_NUM_NC,
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
         .bits_per_pixel = 16,
+        .data_endian = LCD_RGB_DATA_ENDIAN_LITTLE,
     };
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(panel_io, &panel_config, &s_lcd_panel), TAG,
                         "ST7789 init failed");
@@ -290,11 +304,16 @@ static esp_err_t lcd_init(void)
     ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_lcd_panel, true), TAG,
                         "ST7789 display-on failed");
     s_lcd_mutex = xSemaphoreCreateMutex();
+    s_lcd_done = xSemaphoreCreateBinary();
     s_lcd_frame = heap_caps_malloc(LCD_FRAME_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (s_lcd_mutex == NULL || s_lcd_frame == NULL) {
+    if (s_lcd_mutex == NULL || s_lcd_done == NULL || s_lcd_frame == NULL) {
         if (s_lcd_mutex != NULL) {
             vSemaphoreDelete(s_lcd_mutex);
             s_lcd_mutex = NULL;
+        }
+        if (s_lcd_done != NULL) {
+            vSemaphoreDelete(s_lcd_done);
+            s_lcd_done = NULL;
         }
         free(s_lcd_frame);
         s_lcd_frame = NULL;
@@ -305,7 +324,7 @@ static esp_err_t lcd_init(void)
     return ESP_OK;
 }
 
-esp_err_t board_display_status(const char *status)
+esp_err_t board_display_status(const char *status, const char *theme)
 {
     if (s_lcd_panel == NULL || s_lcd_mutex == NULL || s_lcd_frame == NULL || status == NULL) {
         return ESP_ERR_INVALID_STATE;
@@ -330,15 +349,28 @@ esp_err_t board_display_status(const char *status)
     if (xSemaphoreTake(s_lcd_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
+    if (s_lcd_failed) {
+        xSemaphoreGive(s_lcd_mutex);
+        return ESP_FAIL;
+    }
     const uint16_t background = rgb565(10, 18, 32);
     lcd_fill(background);
     lcd_rect(0, 0, LCD_WIDTH, 10, accent);
     lcd_text("ICEBREAKER", 24, 30, 4, rgb565(220, 235, 245));
-    lcd_text(status, 24, 92, 5, accent);
-    lcd_rect(24, 155, 272, 2, accent);
-    lcd_text("K0  START - STOP", 24, 188, 2, rgb565(150, 170, 190));
-    const esp_err_t result = esp_lcd_panel_draw_bitmap(s_lcd_panel, 0, 0, LCD_WIDTH, LCD_HEIGHT,
-                                                        s_lcd_frame);
+    const char *label = strcmp(status, "wifi_connecting") == 0 ? "CONNECTING" : status;
+    lcd_text(label, 24, 90, strlen(label) > 8 ? 4 : 5, accent);
+    if (theme != NULL) lcd_text(theme, 24, 139, 2, rgb565(220, 235, 245));
+    lcd_rect(24, 164, 272, 2, accent);
+    lcd_text("K0 TALK  K1 THEME", 24, 184, 2, rgb565(150, 170, 190));
+    lcd_text("K2 JOIN OR END", 24, 207, 2, rgb565(150, 170, 190));
+    esp_err_t result = esp_lcd_panel_draw_bitmap(s_lcd_panel, 0, 0, LCD_WIDTH, LCD_HEIGHT,
+                                                         s_lcd_frame);
+    // draw_bitmap is asynchronous: do not redraw a buffer still owned by LCD DMA.
+    if (result == ESP_OK && xSemaphoreTake(s_lcd_done, pdMS_TO_TICKS(500)) != pdTRUE) {
+        s_lcd_failed = true;
+        result = ESP_ERR_TIMEOUT;
+        ESP_LOGW(TAG, "LCD DMA timed out; further display updates disabled");
+    }
     xSemaphoreGive(s_lcd_mutex);
     return result;
 }
@@ -562,4 +594,13 @@ void board_stop_audio(void)
 esp_err_t board_get_audio_outputs(uint16_t *outputs)
 {
     return xl9555_read_register(XL9555_REG_OUTPUT_0, outputs);
+}
+
+esp_err_t board_read_activity_buttons(uint8_t *buttons)
+{
+    uint16_t inputs;
+    ESP_RETURN_ON_ERROR(xl9555_read_register(XL9555_REG_INPUT_0, &inputs), TAG, "key read failed");
+    *buttons = ((inputs & (1u << 4)) == 0 ? (1u << 1) : 0) |
+               ((inputs & (1u << 3)) == 0 ? (1u << 2) : 0);
+    return ESP_OK;
 }
