@@ -1,0 +1,31 @@
+# Secrets and local network configuration
+API.txt
+Wifi*.txt
+eim_config.toml
+.env
+.env.*
+
+# Local credentials, captures and generated reports
+*.log
+*.json
+!gateway/package.json
+ses_*.json
+xz_release.json
+flash_dump.bin
+
+# Build and Python artifacts
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/managed_components/espressif__esp_websocket_client/examples/target/main/certs/
+gateway/__pycache__/
+gateway/.pytest_cache/
+*.pyc
+.venv/
+
+# Large presentation/source archives and extracted assets
+*.pptx
+unpacked/
+
+# Native test binaries
+*.exe

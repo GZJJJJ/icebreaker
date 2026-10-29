@@ -1,0 +1,54 @@
+menu "Icebreaker firmware"
+
+config ICEBREAKER_WIFI_SSID
+    string "Wi-Fi SSID"
+    default ""
+    help
+        Wi-Fi network used by the device. Leave empty to skip station startup.
+
+config ICEBREAKER_WIFI_PASSWORD
+    string "Wi-Fi password"
+    default ""
+
+choice ICEBREAKER_WIFI_AUTH
+    prompt "Wi-Fi authentication"
+    default ICEBREAKER_WIFI_AUTH_PSK
+
+config ICEBREAKER_WIFI_AUTH_PSK
+    bool "WPA/WPA2 personal password"
+
+config ICEBREAKER_WIFI_AUTH_ENTERPRISE
+    bool "WPA2-Enterprise PEAP/MSCHAPv2"
+endchoice
+
+config ICEBREAKER_WIFI_USERNAME
+    string "Enterprise username"
+    default ""
+    depends on ICEBREAKER_WIFI_AUTH_ENTERPRISE
+
+config ICEBREAKER_WIFI_IDENTITY
+    string "Enterprise identity (optional)"
+    default ""
+    depends on ICEBREAKER_WIFI_AUTH_ENTERPRISE
+
+config ICEBREAKER_HTTP_PORT
+    int "HTTP server port"
+    range 1 65535
+    default 80
+
+config ICEBREAKER_BUTTON_GPIO
+    int "Interrupt button GPIO"
+    range -1 48
+    default 0
+    help
+        Active-low button GPIO. GPIO0 is the BOOT key on this board. Set to -1
+        to disable the interrupt button.
+
+config ICEBREAKER_GATEWAY_URI
+    string "Gateway WebSocket URI"
+    default ""
+    help
+        For LAN testing use ws://<computer-ip>:8765. The computer and ESP32
+        must be on the same network; do not expose the development Gateway publicly.
+
+endmenu

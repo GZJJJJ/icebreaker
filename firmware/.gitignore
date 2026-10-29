@@ -1,0 +1,4 @@
+build/
+.idf-shims/
+sdkconfig
+sdkconfig.old
