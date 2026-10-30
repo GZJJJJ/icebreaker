@@ -109,7 +109,7 @@
 
 *10月 27, 2026, 21:37 (openai/gpt-6.1-sol, thinking: high)*
 
-开始实现全新的 ESP-IDF 原型工程。第一步先确认本机 ESP-IDF 工具链和当前目录状态，然后建立最小可编译固件；现有 `flash_dump.bin` 仅保留作硬件信息参考，不会被复用或覆盖。
+开始实现全新的 ESP-IDF 原型工程。第一步先确认本机 ESP-IDF 工具链和当前目录状态，然后建立最小可编译固件；现有 `archive/local/flash_dump.bin` 仅保留作硬件信息参考，不会被复用或覆盖。
 
 ---
 

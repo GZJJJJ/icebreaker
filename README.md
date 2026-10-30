@@ -43,6 +43,7 @@
 
 - `firmware/`：ESP-IDF 固件
 - `gateway/`：Python WebSocket Gateway 和 Provider 适配
+- `archive/local/`：本机历史研究和大文件归档，不进入 Git
 - `tools/`：硬件联调工具
 - `gateway/LATENCY.md`：语音链路延迟测量与限制
 - `firmware/README.md`：板级构建、烧录和验收说明
@@ -50,6 +51,8 @@
 ## 安全边界
 
 凭据、Wi-Fi 配置、flash dump、构建产物和本地会话文件不提交到仓库。Provider API Key 只从项目根目录本地配置或环境变量读取。
+
+Gateway 不使用系统默认 Python。首次运行 `gateway\bootstrap.ps1`，以后用 `gateway\start.ps1` 或 `gateway\test.ps1`；专用环境固定 Python 3.12.12，不需要调整 Anaconda。
 
 ## 下一步
 

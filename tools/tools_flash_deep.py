@@ -1,7 +1,8 @@
 import re
 import struct
+from pathlib import Path
 
-data = open('flash_dump.bin', 'rb').read()
+data = (Path(__file__).resolve().parents[1] / 'archive/local/flash_dump.bin').read_bytes()
 
 # 1. partition table @ 0x8000: 32-byte entries, magic 0x50AA
 print('=== partition table ===')

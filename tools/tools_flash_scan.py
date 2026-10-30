@@ -1,6 +1,7 @@
 import re
+from pathlib import Path
 
-data = open('flash_dump.bin', 'rb').read()
+data = (Path(__file__).resolve().parents[1] / 'archive/local/flash_dump.bin').read_bytes()
 
 # ESP app descriptor magic 0xABCD5432 (little endian)
 magic = bytes.fromhex('3254CDAB')

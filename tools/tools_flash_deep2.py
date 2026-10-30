@@ -1,7 +1,8 @@
 import re
 import struct
+from pathlib import Path
 
-data = open('flash_dump.bin', 'rb').read()
+data = (Path(__file__).resolve().parents[1] / 'archive/local/flash_dump.bin').read_bytes()
 
 def hexdump(off, n=128):
     for i in range(0, n, 16):

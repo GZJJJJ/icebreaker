@@ -1,6 +1,7 @@
 import json
+from pathlib import Path
 
-d = json.load(open('xz_release.json', encoding='utf-8'))
+d = json.loads((Path(__file__).resolve().parents[1] / 'archive/local/xz_release.json').read_text(encoding='utf-8'))
 print('tag:', d['tag_name'], '| date:', d['published_at'])
 for a in d['assets']:
     n = a['name'].lower()

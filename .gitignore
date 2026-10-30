@@ -4,6 +4,7 @@ Wifi*.txt
 eim_config.toml
 .env
 .env.*
+.mimosa/
 
 # Local credentials, captures and generated reports
 *.log
@@ -22,10 +23,12 @@ gateway/__pycache__/
 gateway/.pytest_cache/
 *.pyc
 .venv/
+gateway/.venv/
 
 # Large presentation/source archives and extracted assets
 *.pptx
 unpacked/
+archive/local/
 
 # Native test binaries
 *.exe

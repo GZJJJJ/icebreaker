@@ -6,9 +6,11 @@
 
 ```powershell
 cd gateway
-python -m pip install -r requirements.txt
-python server.py
+.\bootstrap.ps1
+.\start.ps1
 ```
+
+Gateway 使用独立 `.venv` 和 Python 3.12.12；启动不依赖 PATH 中 `python` 的排序，也不改动 Anaconda。Anaconda 的 websockets 16 / pytest 9 不满足当前约束，缺少 `pytest-asyncio` 时测试也不会运行。
 
 默认监听 `ws://127.0.0.1:8765`。
 
@@ -28,7 +30,7 @@ Gateway 必须在电脑上持续运行；关闭运行它的终端后，设备无
 $env:ICEBREAKER_MOCK="0"
 $env:SILICONFLOW_ASR_MODEL="FunAudioLLM/SenseVoiceSmall"
 $env:SILICONFLOW_MODEL="deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
-python server.py
+& .\.venv\Scripts\python.exe .\server.py
 ```
 
 ## 协议最小闭环
@@ -74,7 +76,7 @@ Gateway 发送结束后返回 `session.state:idle`，只表示云端处理完成
 同一句合成语音，对比普通会话与“取消后立即开始下一轮”（真实 Provider，会发起云请求；不会从设备播放）：
 
 ```powershell
-python gateway/benchmark_latency.py --runs 1 --output "$env:TEMP/icebreaker-latency.json"
+& .\.venv\Scripts\python.exe .\benchmark_latency.py --runs 1 --output "$env:TEMP/icebreaker-latency.json"
 ```
 
 该探针测电脑到 Gateway 的协议耗时；不含 K0、麦克风、Wi-Fi 下传和实际出声。
@@ -83,7 +85,7 @@ python gateway/benchmark_latency.py --runs 1 --output "$env:TEMP/icebreaker-late
 ## 验收
 
 ```powershell
-python -m pytest -q
+.\test.ps1
 ```
 
 离线测试覆盖正常会话、多轮、打断、重启/断线取消、空/超长/无效音频、ASR/LLM/TTS 失败与超时、FFmpeg 取消清理，禁止真实 Provider HTTP 请求。
