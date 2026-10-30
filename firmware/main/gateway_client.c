@@ -507,6 +507,7 @@ bool gateway_client_activity_pending(void) { return s_activity_pending; }
 const char *gateway_client_activity_theme(void) { return THEMES[s_activity_theme]; }
 bool gateway_client_hint_ready(void) { return s_hint_ready; }
 void gateway_client_hint_dismiss(void) { s_hint_ready = false; }
+bool gateway_client_hints_enabled(void) { return s_hints_enabled; }
 
 esp_err_t gateway_client_hint_request(uint32_t silence_ms)
 {

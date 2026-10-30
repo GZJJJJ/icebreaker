@@ -38,7 +38,7 @@ void gateway_client_playback_started(void);
 esp_err_t gateway_client_hint_request(uint32_t silence_ms);
 bool gateway_client_hint_ready(void);
 void gateway_client_hint_dismiss(void);
-void gateway_client_hint_dismiss(void);
+bool gateway_client_hints_enabled(void);
 esp_err_t gateway_client_send_event(const char *event_json);
 esp_err_t gateway_client_send_audio(const void *data, size_t length);
 int gateway_client_stats(char *buffer, size_t size);

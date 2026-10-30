@@ -80,6 +80,27 @@ async def test_hint_validation_and_busy(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_hint_dismiss_cancels_generation_and_returns_no_late_suggestion(monkeypatch):
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def blocked_hint(session):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(server, "generate_hint", blocked_hint)
+    ws, session = Socket(), Session(mock=False)
+    await event(ws, session, "activity.start", consent=True, hints_enabled=True)
+    await event(ws, session, "hint.request", silence_ms=25000)
+    await asyncio.wait_for(entered.wait(), 1)
+    await event(ws, session, "hint.dismiss")
+    assert cancelled.is_set() and session.hint_task is None
+    assert not any(message["event"] == "hint.suggestion" for message in ws.events)
+
+
+@pytest.mark.asyncio
 async def test_activity_spans_turns_interrupt_keeps_context_end_clears():
     session, ws = server.Session(), Socket()
     await event(ws, session, "activity.start", consent=True, scene="date", theme="reading")

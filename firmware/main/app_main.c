@@ -49,8 +49,9 @@ static atomic_bool s_capture_active;
 static atomic_bool s_capture_cancelled;
 static atomic_uint s_button_presses;
 static atomic_uint s_selected_theme;
+static atomic_bool s_hint_consent;
 static const char *THEMES[] = {"travel", "film", "reading", "general"};
-static size_t s_silence_ms;
+static atomic_uint s_silence_ms;
 static int64_t s_last_hint_at;
 
 static bool audio_chunk_has_voice(const int16_t *samples, size_t count)
@@ -91,7 +92,8 @@ static void set_state(app_state_t state)
     }
 
     ESP_LOGI(TAG, "state: %s -> %s", state_name(previous), state_name(state));
-    board_display_status(state_name(state), THEMES[s_selected_theme]);
+    board_display_status(state_name(state), THEMES[s_selected_theme],
+                         gateway_client_hints_enabled() || s_hint_consent);
 }
 
 static void player_event(audio_player_event_t event)
@@ -110,6 +112,7 @@ static void gateway_event(gateway_event_t event)
 {
     if (event == GATEWAY_ACTIVITY_CHANGED) {
         const char *theme = gateway_client_activity_theme();
+        s_hint_consent = gateway_client_hints_enabled();
         for (unsigned i = 0; i < 4; ++i) {
             if (strcmp(theme, THEMES[i]) == 0) s_selected_theme = i;
         }
@@ -118,7 +121,7 @@ static void gateway_event(gateway_event_t event)
             set_state(activity == ACTIVITY_ACTIVE ? APP_STATE_HOSTING :
                       activity == ACTIVITY_PAUSED ? APP_STATE_PAUSED : APP_STATE_IDLE);
             board_display_status(gateway_client_hint_ready() ? "hint" : state_name(s_state),
-                                 THEMES[s_selected_theme]);
+                                 THEMES[s_selected_theme], gateway_client_hints_enabled());
         }
     } else if (event == GATEWAY_READY) {
         if (!s_capture_active && !audio_player_busy()) {
@@ -161,7 +164,10 @@ static esp_err_t activity_command(const char *action, const char *scene, const c
     if (strcmp(action, "pause") == 0 || strcmp(action, "end") == 0) {
         stop_audio();
     }
-    return gateway_client_activity(action, scene, theme, strcmp(action, "start") == 0);
+    if (strcmp(action, "hints_on") == 0 || strcmp(action, "hints_off") == 0)
+        return gateway_client_activity(action, scene, theme, false);
+    return gateway_client_activity(action, scene, theme,
+                                   strcmp(action, "start") == 0 && s_hint_consent);
 }
 
 static void capture_task(void *arg)
@@ -182,9 +188,15 @@ static void capture_task(void *arg)
     while (true) {
         if (!s_capture_active) {
             if (gateway_client_activity_state() == ACTIVITY_ACTIVE &&
+                (gateway_client_activity_pending() || gateway_client_hint_ready())) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+            } else if (gateway_client_activity_state() == ACTIVITY_ACTIVE &&
                 s_state == APP_STATE_HOSTING && !gateway_client_activity_pending() &&
-                !gateway_client_hint_ready() && board_read_audio(pcm, frames) == ESP_OK) {
-                if (audio_chunk_has_voice(pcm, frames)) s_silence_ms = 0;
+                gateway_client_hints_enabled() && board_read_audio(pcm, frames) == ESP_OK) {
+                if (audio_chunk_has_voice(pcm, frames)) {
+                    s_silence_ms = 0;
+                    gateway_client_hint_dismiss();
+                }
                 else s_silence_ms += CHUNK_MS;
                 const int64_t now = esp_timer_get_time();
                 if (s_silence_ms >= 25000 &&
@@ -193,8 +205,9 @@ static void capture_task(void *arg)
                     s_last_hint_at = now;
                     s_silence_ms = 0;
                 }
-            } else if (gateway_client_activity_state() != ACTIVITY_ACTIVE) {
+            } else {
                 s_silence_ms = 0;
+                vTaskDelay(pdMS_TO_TICKS(30));
             }
             continue;
         }
@@ -260,19 +273,33 @@ static void button_task(void *arg)
     uint32_t event;
     TickType_t last_trigger[4] = {0};
     while (xQueueReceive(s_button_events, &event, portMAX_DELAY) == pdTRUE) {
-        if (event < 1 || event > 3) continue;
+        if (event < 1 || event > 4) continue;
         vTaskDelay(pdMS_TO_TICKS(40));
         const TickType_t now = xTaskGetTickCount();
         if (last_trigger[event] != 0 && (now - last_trigger[event]) < pdMS_TO_TICKS(500)) {
             continue;
         }
         last_trigger[event] = now;
+        if (event == 4) {
+            const bool enabled = gateway_client_activity_state() == ACTIVITY_ACTIVE ||
+                                 gateway_client_activity_state() == ACTIVITY_PAUSED
+                                     ? !gateway_client_hints_enabled() : !s_hint_consent;
+            const activity_state_t activity = gateway_client_activity_state();
+            if (activity == ACTIVITY_ACTIVE || activity == ACTIVITY_PAUSED) {
+                if (gateway_client_activity(enabled ? "hints_on" : "hints_off", NULL, NULL, enabled) != ESP_OK)
+                    ESP_LOGW(TAG, "hint permission update failed");
+            } else {
+                s_hint_consent = enabled;
+                board_display_status(state_name(s_state), THEMES[s_selected_theme], s_hint_consent);
+            }
+            continue;
+        }
         if (event == 2) {
             const activity_state_t activity = gateway_client_activity_state();
             if (!gateway_client_activity_pending() && activity != ACTIVITY_ACTIVE &&
                 activity != ACTIVITY_PAUSED && !s_capture_active && !audio_player_busy()) {
                 s_selected_theme = (s_selected_theme + 1) % 4;
-                board_display_status(state_name(s_state), THEMES[s_selected_theme]);
+                board_display_status(state_name(s_state), THEMES[s_selected_theme], s_hint_consent);
             }
             continue;
         }
@@ -297,6 +324,8 @@ static void button_task(void *arg)
             set_state(APP_STATE_THINKING);
         } else if (!s_capture_active) {
             s_capture_cancelled = false;
+            s_silence_ms = 0;
+            gateway_client_hint_dismiss();
             if (gateway_client_begin_turn() != ESP_OK) {
                 ESP_LOGW(TAG, "Gateway is not connected; cannot start capture");
                 continue;
@@ -312,15 +341,34 @@ static void button_task(void *arg)
 static void activity_buttons_task(void *arg)
 {
     uint8_t previous = 0;
+    TickType_t key1_started = 0;
+    bool key1_long_sent = false;
     while (true) {
         uint8_t buttons = 0;
         if (board_read_activity_buttons(&buttons) == ESP_OK) {
-            const uint8_t pressed = buttons & (uint8_t)~previous;
-            for (uint32_t key = 1; key <= 2; ++key) {
-                if ((pressed & (1u << key)) != 0) {
-                    const uint32_t event = key + 1;
+            const TickType_t now = xTaskGetTickCount();
+            const bool key1_down = (buttons & (1u << 1)) != 0;
+            const bool key2_down = (buttons & (1u << 2)) != 0;
+            const bool key1_was_down = (previous & (1u << 1)) != 0;
+            const bool key2_was_down = (previous & (1u << 2)) != 0;
+            if (key1_down && !key1_was_down) {
+                key1_started = now;
+                key1_long_sent = false;
+            } else if (key1_down && !key1_long_sent &&
+                       now - key1_started >= pdMS_TO_TICKS(800)) {
+                const uint32_t event = 4;
+                xQueueSend(s_button_events, &event, 0);
+                key1_long_sent = true;
+            } else if (!key1_down && key1_was_down) {
+                if (!key1_long_sent) {
+                    const uint32_t event = 2;
                     xQueueSend(s_button_events, &event, 0);
                 }
+                key1_started = 0;
+            }
+            if (key2_down && !key2_was_down) {
+                const uint32_t event = 3;
+                xQueueSend(s_button_events, &event, 0);
             }
             previous = buttons;
         }
@@ -639,7 +687,7 @@ void app_main(void)
     ESP_ERROR_CHECK(nvs_result);
 
     ESP_ERROR_CHECK(board_init());
-    board_display_status("boot", THEMES[s_selected_theme]);
+    board_display_status("boot", THEMES[s_selected_theme], s_hint_consent);
     board_mic_probe();
     ESP_ERROR_CHECK(audio_player_init(player_event));
     ESP_ERROR_CHECK(button_init());

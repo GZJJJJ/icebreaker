@@ -324,7 +324,7 @@ static esp_err_t lcd_init(void)
     return ESP_OK;
 }
 
-esp_err_t board_display_status(const char *status, const char *theme)
+esp_err_t board_display_status(const char *status, const char *theme, bool hints_enabled)
 {
     if (s_lcd_panel == NULL || s_lcd_mutex == NULL || s_lcd_frame == NULL || status == NULL) {
         return ESP_ERR_INVALID_STATE;
@@ -363,13 +363,15 @@ esp_err_t board_display_status(const char *status, const char *theme)
     lcd_text(label, 24, 90, strlen(label) > 8 ? 4 : 5, accent);
     if (theme != NULL) lcd_text(theme, 24, 139, 2, rgb565(220, 235, 245));
     lcd_rect(24, 164, 272, 2, accent);
-    lcd_text("K0 TALK  K1 THEME", 24, 184, 2, rgb565(150, 170, 190));
+    lcd_text("K0 TALK  K1 THEME", 24, 168, 2, rgb565(150, 170, 190));
+    lcd_text(hints_enabled ? "HINTS ON" : "HINTS OFF - HOLD K1", 24, 191, 1,
+             hints_enabled ? rgb565(245, 190, 90) : rgb565(150, 170, 190));
     if (strcmp(status, "idle") == 0) {
-        lcd_text("K2 JOIN - VOICE TO CLOUD", 24, 207, 1, rgb565(245, 190, 90));
+        lcd_text("K2 JOIN - VOICE TO CLOUD", 24, 212, 1, rgb565(245, 190, 90));
     } else if (strcmp(status, "hosting") == 0) {
-        lcd_text("K2 END ACTIVITY", 24, 207, 2, rgb565(245, 190, 90));
+        lcd_text("K2 END ACTIVITY", 24, 212, 2, rgb565(245, 190, 90));
     } else {
-        lcd_text("K2 JOIN / END", 24, 207, 2, rgb565(150, 170, 190));
+        lcd_text("K2 JOIN / END", 24, 212, 2, rgb565(150, 170, 190));
     }
     esp_err_t result = esp_lcd_panel_draw_bitmap(s_lcd_panel, 0, 0, LCD_WIDTH, LCD_HEIGHT,
                                                          s_lcd_frame);
