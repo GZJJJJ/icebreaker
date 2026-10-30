@@ -344,6 +344,8 @@ esp_err_t board_display_status(const char *status, const char *theme)
         accent = rgb565(255, 80, 80);
     } else if (strcmp(status, "wifi_connecting") == 0) {
         accent = rgb565(255, 170, 60);
+    } else if (strcmp(status, "hint") == 0) {
+        accent = rgb565(255, 210, 70);
     }
 
     if (xSemaphoreTake(s_lcd_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {

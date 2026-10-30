@@ -19,6 +19,7 @@ from activity import Activity
 
 LOG = logging.getLogger("icebreaker.gateway")
 REPLY_TIMEOUT_SECONDS = 120
+HINT_TIMEOUT_SECONDS = 30
 MAX_CAPTURE_BYTES = 16000 * 2 * 30
 MAX_TTS_BYTES = 900 * 1024
 
@@ -47,6 +48,7 @@ class Session:
     state: str = "connected"
     audio: bytearray = field(default_factory=bytearray)
     reply_task: asyncio.Task | None = None
+    hint_task: asyncio.Task | None = None
     mock: bool = True
     turn: int = 0
     activity: Activity = field(default_factory=Activity)
@@ -64,6 +66,54 @@ async def cancel_reply(session: Session) -> int:
         session.reply_task = None
     session.audio.clear()
     return round((time.perf_counter() - started) * 1000)
+
+
+async def cancel_hint(session: Session) -> None:
+    if session.hint_task is not None:
+        session.hint_task.cancel()
+        await asyncio.gather(session.hint_task, return_exceptions=True)
+        session.hint_task = None
+
+
+async def generate_hint(session: Session) -> str:
+    prompt = (
+        "请结合下面这桌咖啡馆活动的主题和最近对话，写1个适合所有人自愿回答的中文话题。"
+        "只输出话题本身，最多28个汉字；不要提到安静、尴尬、监测或摄像头，"
+        "不询问隐私，不点名，不预设性别、关系或情绪，不用表情。"
+    )
+    if session.mock:
+        return "最近有没有一件让你觉得有趣的小事？"
+    response = ""
+    provider = SiliconFlowLlmProvider(
+        load_api_key(), os.getenv("SILICONFLOW_MODEL", "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B")
+    )
+    async for delta in provider.reply(
+        prompt, history=list(session.activity.history), context=session.activity.context()
+    ):
+        response += delta
+        if len(response) > 160:
+            break
+    return response.strip()[:80]
+
+
+async def run_hint(ws: ServerConnection, session: Session, silence_ms: int) -> None:
+    try:
+        async with asyncio.timeout(HINT_TIMEOUT_SECONDS):
+            suggestion = await generate_hint(session)
+            if not suggestion:
+                await send_json(ws, "hint.error", code="empty_hint")
+                return
+            await send_json(ws, "hint.suggestion", text=suggestion[:200], silence_ms=silence_ms,
+                            spoken=False)
+    except asyncio.CancelledError:
+        raise
+    except TimeoutError:
+        await send_json(ws, "hint.error", code="hint_timeout")
+    except Exception as exc:
+        LOG.warning("hint failed (%s)", type(exc).__name__)
+        await send_json(ws, "hint.error", code="hint_failed")
+    finally:
+        session.hint_task = None
 
 
 async def run_reply(ws: ServerConnection, session: Session, pcm: bytes) -> None:
@@ -208,6 +258,7 @@ async def handle_message(ws: ServerConnection, session: Session, message: str | 
             await send_json(ws, "activity.error", code=str(exc))
             return
         await cancel_reply(session)
+        await cancel_hint(session)
         session.activity.end()
         session.activity = activity
         session.state = "idle"
@@ -221,17 +272,26 @@ async def handle_message(ws: ServerConnection, session: Session, message: str | 
             await send_json(ws, "activity.error", code="invalid_activity_state")
             return
         await cancel_reply(session)
+        await cancel_hint(session)
         if event == "activity.end":
             session.activity.end()
         else:
             session.activity.state = "paused" if event == "activity.pause" else "active"
         session.state = "idle"
         await send_json(ws, "activity.state", **session.activity.snapshot())
+    elif event == "activity.hints.set":
+        if session.activity.state not in {"active", "paused"} or not isinstance(request.get("enabled"), bool):
+            await send_json(ws, "activity.error", code="invalid_hints_permission")
+            return
+        await cancel_hint(session)
+        session.activity.hints_enabled = request["enabled"]
+        await send_json(ws, "activity.state", **session.activity.snapshot())
     elif event == "session.start":
         if session.activity.state in {"paused", "ended"}:
             await send_json(ws, "activity.error", code="activity_not_active")
             return
         cancel_ms = await cancel_reply(session)
+        await cancel_hint(session)
         session.turn += 1
         session.state = "listening"
         LOG.info("turn.start connection=%x turn=%d cancel_ms=%d", id(session), session.turn, cancel_ms)
@@ -263,14 +323,28 @@ async def handle_message(ws: ServerConnection, session: Session, message: str | 
             session.reply_task = asyncio.create_task(run_reply(ws, session, pcm))
     elif event == "session.interrupt":
         cancel_ms = await cancel_reply(session)
+        await cancel_hint(session)
         session.state = "interrupted"
         LOG.info("turn.interrupt connection=%x turn=%d cancel_ms=%d", id(session), session.turn, cancel_ms)
         await send_json(ws, "session.state", state=session.state, cancel_ms=cancel_ms)
     elif event == "session.end":
         await cancel_reply(session)
+        await cancel_hint(session)
         session.activity.end()
         session.state = "ended"
         await send_json(ws, "session.state", state=session.state)
+    elif event == "hint.request":
+        silence_ms = request.get("silence_ms")
+        if session.activity.state != "active" or not session.activity.hints_enabled:
+            await send_json(ws, "hint.error", code="hints_not_enabled")
+        elif not isinstance(silence_ms, int) or silence_ms < 0 or silence_ms > 3600000:
+            await send_json(ws, "hint.error", code="invalid_silence")
+        elif session.reply_task is not None or session.hint_task is not None:
+            await send_json(ws, "hint.error", code="busy")
+        else:
+            session.hint_task = asyncio.create_task(run_hint(ws, session, silence_ms))
+    elif event == "hint.dismiss":
+        await cancel_hint(session)
     else:
         await send_json(ws, "error", code="unknown_event", received_event=event)
 
@@ -284,6 +358,7 @@ async def connection_handler(ws: ServerConnection) -> None:
             await handle_message(ws, session, message)
     finally:
         await cancel_reply(session)
+        await cancel_hint(session)
         session.activity.end()
 
 

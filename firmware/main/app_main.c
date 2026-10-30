@@ -50,6 +50,21 @@ static atomic_bool s_capture_cancelled;
 static atomic_uint s_button_presses;
 static atomic_uint s_selected_theme;
 static const char *THEMES[] = {"travel", "film", "reading", "general"};
+static size_t s_silence_ms;
+static int64_t s_last_hint_at;
+
+static bool audio_chunk_has_voice(const int16_t *samples, size_t count)
+{
+    int64_t sum = 0;
+    for (size_t i = 0; i < count; ++i) sum += samples[i];
+    const int32_t mean = (int32_t)(sum / (int64_t)count);
+    uint64_t energy = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const int32_t centered = (int32_t)samples[i] - mean;
+        energy += (uint64_t)(centered * centered);
+    }
+    return energy / count > 450000;
+}
 
 static const char *state_name(app_state_t state)
 {
@@ -102,7 +117,8 @@ static void gateway_event(gateway_event_t event)
             const activity_state_t activity = gateway_client_activity_state();
             set_state(activity == ACTIVITY_ACTIVE ? APP_STATE_HOSTING :
                       activity == ACTIVITY_PAUSED ? APP_STATE_PAUSED : APP_STATE_IDLE);
-            board_display_status(state_name(s_state), THEMES[s_selected_theme]);
+            board_display_status(gateway_client_hint_ready() ? "hint" : state_name(s_state),
+                                 THEMES[s_selected_theme]);
         }
     } else if (event == GATEWAY_READY) {
         if (!s_capture_active && !audio_player_busy()) {
@@ -145,7 +161,7 @@ static esp_err_t activity_command(const char *action, const char *scene, const c
     if (strcmp(action, "pause") == 0 || strcmp(action, "end") == 0) {
         stop_audio();
     }
-    return gateway_client_activity(action, scene, theme);
+    return gateway_client_activity(action, scene, theme, strcmp(action, "start") == 0);
 }
 
 static void capture_task(void *arg)
@@ -165,7 +181,21 @@ static void capture_task(void *arg)
     size_t captured_frames = 0;
     while (true) {
         if (!s_capture_active) {
-            vTaskDelay(pdMS_TO_TICKS(20));
+            if (gateway_client_activity_state() == ACTIVITY_ACTIVE &&
+                s_state == APP_STATE_HOSTING && !gateway_client_activity_pending() &&
+                !gateway_client_hint_ready() && board_read_audio(pcm, frames) == ESP_OK) {
+                if (audio_chunk_has_voice(pcm, frames)) s_silence_ms = 0;
+                else s_silence_ms += CHUNK_MS;
+                const int64_t now = esp_timer_get_time();
+                if (s_silence_ms >= 25000 &&
+                    (s_last_hint_at == 0 || now - s_last_hint_at >= 60000000LL) &&
+                    gateway_client_hint_request((uint32_t)s_silence_ms) == ESP_OK) {
+                    s_last_hint_at = now;
+                    s_silence_ms = 0;
+                }
+            } else if (gateway_client_activity_state() != ACTIVITY_ACTIVE) {
+                s_silence_ms = 0;
+            }
             continue;
         }
         if (!s_capture_requested) {

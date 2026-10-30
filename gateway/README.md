@@ -56,6 +56,8 @@ Gateway 返回：
 - `tts.end`（整段发送完毕，设备转交本地播放器）
 - `error`
 
+活动开启时可传 `hints_enabled:true`；设备在本地检测到约 25 秒静默后发送 `hint.request`，Gateway 返回 `hint.suggestion`。建议不会自动合成或播放，只作为屏幕提示；暂停、结束、打断和断线会取消提示任务。
+
 Gateway 发送结束后返回 `session.state:idle`，只表示云端处理完成，不表示扬声器已播完。
 设备必须以播放器完成回调更新实际状态。新会话、打断、结束、断线均取消旧任务并清空录音。
 上行最多 30 秒（16 kHz mono PCM16）；下行最多 900 KiB；云端整轮超时为 120 秒。

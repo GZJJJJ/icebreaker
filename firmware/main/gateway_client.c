@@ -22,9 +22,12 @@ static atomic_bool s_upload_enabled;
 static atomic_int s_activity_state = ACTIVITY_NONE;
 static atomic_bool s_activity_pending;
 static atomic_int s_activity_theme;
+static atomic_bool s_hints_enabled;
 static const char *THEMES[] = {"travel", "film", "reading", "general"};
 static const char *s_activity_scene = "social";
 static unsigned s_history_turns;
+static atomic_bool s_hint_pending;
+static atomic_bool s_hint_ready;
 static SemaphoreHandle_t s_gate;
 static void (*s_callback)(gateway_event_t event);
 static unsigned s_turn;
@@ -188,6 +191,9 @@ static void handle_json(cJSON *root)
         s_activity_state = ACTIVITY_NONE;
         s_activity_pending = false;
         s_history_turns = 0;
+        s_hints_enabled = false;
+        s_hint_pending = false;
+        s_hint_ready = false;
         s_reply_stage = "idle";
         notify(GATEWAY_READY);
         return;
@@ -215,9 +221,28 @@ static void handle_json(cJSON *root)
         }
         const cJSON *history = cJSON_GetObjectItemCaseSensitive(root, "history_turns");
         s_history_turns = cJSON_IsNumber(history) && history->valueint >= 0 ? history->valueint : 0;
+        const cJSON *hints = cJSON_GetObjectItemCaseSensitive(root, "hints_enabled");
+        s_hints_enabled = cJSON_IsTrue(hints);
         s_activity_pending = false;
+        s_hint_ready = false;
         s_reply_stage = "idle";
         notify(GATEWAY_ACTIVITY_CHANGED);
+        return;
+    }
+    if (strcmp(name->valuestring, "hint.suggestion") == 0) {
+        s_hint_pending = false;
+        s_hint_ready = true;
+        s_reply_stage = "hint_ready";
+        const cJSON *suggestion = cJSON_GetObjectItemCaseSensitive(root, "text");
+        if (cJSON_IsString(suggestion)) {
+            ESP_LOGI(TAG, "topic suggestion ready (%u chars)",
+                     (unsigned)strlen(suggestion->valuestring));
+        }
+        notify(GATEWAY_ACTIVITY_CHANGED);
+        return;
+    }
+    if (strcmp(name->valuestring, "hint.error") == 0) {
+        s_hint_pending = false;
         return;
     }
     if (strcmp(name->valuestring, "activity.error") == 0) {
@@ -360,6 +385,8 @@ static void gateway_event_handler(void *arg, esp_event_base_t event_base,
         s_activity_state = ACTIVITY_NONE;
         s_activity_pending = false;
         s_history_turns = 0;
+        s_hint_pending = false;
+        s_hint_ready = false;
         gateway_client_cancel();
         notify(GATEWAY_DISCONNECTED);
         ESP_LOGW(TAG, "disconnected; client will reconnect");
@@ -478,6 +505,23 @@ esp_err_t gateway_client_begin_turn(void)
 activity_state_t gateway_client_activity_state(void) { return s_activity_state; }
 bool gateway_client_activity_pending(void) { return s_activity_pending; }
 const char *gateway_client_activity_theme(void) { return THEMES[s_activity_theme]; }
+bool gateway_client_hint_ready(void) { return s_hint_ready; }
+void gateway_client_hint_dismiss(void) { s_hint_ready = false; }
+
+esp_err_t gateway_client_hint_request(uint32_t silence_ms)
+{
+    if (!s_connected || s_activity_state != ACTIVITY_ACTIVE || !s_hints_enabled || s_activity_pending ||
+        s_hint_pending || s_hint_ready || audio_player_busy()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    char request[96];
+    snprintf(request, sizeof(request),
+        "{\"event\":\"hint.request\",\"silence_ms\":%u}", (unsigned)silence_ms);
+    s_hint_pending = true;
+    const esp_err_t result = gateway_client_send_event(request);
+    if (result != ESP_OK) s_hint_pending = false;
+    return result;
+}
 
 int gateway_client_activity_stats(char *buffer, size_t size)
 {
@@ -485,14 +529,17 @@ int gateway_client_activity_stats(char *buffer, size_t size)
     xSemaphoreTake(s_gate, portMAX_DELAY);
     const int length = snprintf(buffer, size,
         "{\"state\":\"%s\",\"pending\":%s,\"scene\":\"%s\",\"theme\":\"%s\","
-        "\"history_turns\":%u,\"camera_enabled\":false,\"hints_enabled\":false}\n",
+        "\"history_turns\":%u,\"camera_enabled\":false,\"hints_enabled\":%s,\"hint_ready\":%s}\n",
         states[s_activity_state], s_activity_pending ? "true" : "false", s_activity_scene,
-        THEMES[s_activity_theme], s_history_turns);
+        THEMES[s_activity_theme], s_history_turns,
+        (s_activity_state == ACTIVITY_ACTIVE || s_activity_state == ACTIVITY_PAUSED) && s_hints_enabled ? "true" : "false",
+        s_hint_ready ? "true" : "false");
     xSemaphoreGive(s_gate);
     return length;
 }
 
-esp_err_t gateway_client_activity(const char *action, const char *scene, const char *theme)
+esp_err_t gateway_client_activity(const char *action, const char *scene, const char *theme,
+                                  bool hints_enabled)
 {
     if (!s_connected || action == NULL || s_activity_pending) return ESP_ERR_INVALID_STATE;
     char request[224];
@@ -504,10 +551,13 @@ esp_err_t gateway_client_activity(const char *action, const char *scene, const c
         for (int i = 0; i < 4; ++i) valid |= strcmp(theme, THEMES[i]) == 0;
         if (!valid) return ESP_ERR_INVALID_ARG;
         snprintf(request, sizeof(request),
-            "{\"event\":\"activity.start\",\"consent\":true,\"scene\":\"%s\",\"theme\":\"%s\"}",
-            scene, theme);
+            "{\"event\":\"activity.start\",\"consent\":true,\"scene\":\"%s\",\"theme\":\"%s\",\"hints_enabled\":%s}",
+            scene, theme, hints_enabled ? "true" : "false");
     } else if (strcmp(action, "pause") == 0 || strcmp(action, "resume") == 0 || strcmp(action, "end") == 0) {
         snprintf(request, sizeof(request), "{\"event\":\"activity.%s\"}", action);
+    } else if (strcmp(action, "hints_on") == 0 || strcmp(action, "hints_off") == 0) {
+        snprintf(request, sizeof(request), "{\"event\":\"activity.hints.set\",\"enabled\":%s}",
+                 strcmp(action, "hints_on") == 0 ? "true" : "false");
     } else {
         return ESP_ERR_INVALID_ARG;
     }

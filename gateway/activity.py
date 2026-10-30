@@ -1,4 +1,4 @@
-"""In-memory hosting activity; camera and automatic prompts remain disabled."""
+"""In-memory hosting activity and explicit consent flags."""
 
 from dataclasses import dataclass, field
 
@@ -24,6 +24,7 @@ class Activity:
     scene: str = "social"
     theme: str = "travel"
     history: list[dict[str, str]] = field(default_factory=list)
+    hints_enabled: bool = False
 
     @classmethod
     def from_request(cls, request: dict):
@@ -34,15 +35,18 @@ class Activity:
             raise ValueError("invalid_scene")
         if not isinstance(theme, str) or theme not in THEMES:
             raise ValueError("invalid_theme")
-        if request.get("camera_enabled", False) is not False or request.get("hints_enabled", False) is not False:
+        if request.get("camera_enabled", False) is not False:
             raise ValueError("feature_not_ready")
-        return cls(state="active", scene=scene, theme=theme)
+        hints_enabled = request.get("hints_enabled", False)
+        if not isinstance(hints_enabled, bool):
+            raise ValueError("invalid_hints_permission")
+        return cls(state="active", scene=scene, theme=theme, hints_enabled=hints_enabled)
 
     def snapshot(self):
         return {"state": self.state, "scene": self.scene, "theme": self.theme,
                 "theme_label": THEMES[self.theme][0], "opener": THEMES[self.theme][1],
                 "history_turns": len(self.history) // 2,
-                "camera_enabled": False, "hints_enabled": False}
+                "camera_enabled": False, "hints_enabled": self.hints_enabled}
 
     def context(self):
         return f"当前活动场景：{SCENES[self.scene]} 当前主题：{THEMES[self.theme][0]}。尊重用户换题和跳过。"
@@ -59,3 +63,4 @@ class Activity:
         self.state = "ended"
         self.scene = "social"
         self.theme = "travel"
+        self.hints_enabled = False

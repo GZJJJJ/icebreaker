@@ -4,6 +4,7 @@ import json
 import pytest
 
 import server
+from server import Session
 from activity import Activity, MAX_HISTORY_TURNS, MAX_MESSAGE_CHARS
 
 
@@ -41,7 +42,6 @@ def offline(monkeypatch):
     ({"consent": True, "scene": "guessed_romance"}, "invalid_scene"),
     ({"consent": True, "theme": {}}, "invalid_theme"),
     ({"consent": True, "camera_enabled": True}, "feature_not_ready"),
-    ({"consent": True, "hints_enabled": True}, "feature_not_ready"),
 ])
 @pytest.mark.asyncio
 async def test_invalid_start_keeps_existing_activity(payload, code):
@@ -51,6 +51,32 @@ async def test_invalid_start_keeps_existing_activity(payload, code):
     await event(ws, session, "activity.start", **payload)
     assert ws.events[-1] == {"event": "activity.error", "code": code}
     assert session.activity.theme == "film" and session.activity.history
+
+
+@pytest.mark.asyncio
+async def test_hints_require_consent_and_return_suggestion(monkeypatch):
+    ws, session = Socket(), Session(mock=True)
+    await event(ws, session, "activity.start", consent=True, hints_enabled=False)
+    await event(ws, session, "hint.request", silence_ms=25000)
+    assert ws.events[-1] == {"event": "hint.error", "code": "hints_not_enabled"}
+    await event(ws, session, "activity.start", consent=True, hints_enabled=True)
+    await event(ws, session, "hint.request", silence_ms=25000)
+    await asyncio.sleep(0)
+    assert ws.events[-1]["event"] == "hint.suggestion"
+    assert ws.events[-1]["spoken"] is False
+    await event(ws, session, "activity.pause")
+    assert session.hint_task is None
+
+
+@pytest.mark.asyncio
+async def test_hint_validation_and_busy(monkeypatch):
+    ws, session = Socket(), Session(mock=True)
+    await event(ws, session, "activity.start", consent=True, hints_enabled=True)
+    await event(ws, session, "hint.request", silence_ms=-1)
+    assert ws.events[-1]["code"] == "invalid_silence"
+    await event(ws, session, "hint.request", silence_ms=25000)
+    await event(ws, session, "hint.request", silence_ms=25000)
+    assert ws.events[-1]["code"] == "busy"
 
 
 @pytest.mark.asyncio
