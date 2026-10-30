@@ -1,5 +1,6 @@
 #include "board.h"
 #include "board_audio_control.h"
+#include "board_font.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -165,6 +166,29 @@ static void lcd_text(const char *text, int x, int y, int scale, uint16_t color)
             }
         }
         x += 6 * scale;
+    }
+}
+
+static const uint16_t *zh_glyph(uint16_t code)
+{
+    for (unsigned i = 0; i < BOARD_GLYPH_COUNT; ++i) {
+        if (BOARD_GLYPHS[i].code == code) return BOARD_GLYPHS[i].rows;
+    }
+    return NULL;
+}
+
+static void lcd_text_zh(const uint16_t *text, size_t count, int x, int y,
+                        int scale, uint16_t color)
+{
+    for (size_t index = 0; index < count; ++index, x += 16 * scale) {
+        const uint16_t *glyph = zh_glyph(text[index]);
+        if (glyph == NULL) continue;
+        for (int row = 0; row < 16; ++row) {
+            for (int column = 0; column < 16; ++column) {
+                if ((glyph[row] & (1u << (15 - column))) == 0) continue;
+                lcd_rect(x + column * scale, y + row * scale, scale, scale, color);
+            }
+        }
     }
 }
 
@@ -358,21 +382,57 @@ esp_err_t board_display_status(const char *status, const char *theme, bool hints
     const uint16_t background = rgb565(10, 18, 32);
     lcd_fill(background);
     lcd_rect(0, 0, LCD_WIDTH, 10, accent);
-    lcd_text("ICEBREAKER", 24, 30, 4, rgb565(220, 235, 245));
-    const char *label = strcmp(status, "wifi_connecting") == 0 ? "CONNECTING" : status;
-    lcd_text(label, 24, 90, strlen(label) > 8 ? 4 : 5, accent);
-    if (theme != NULL) lcd_text(theme, 24, 139, 2, rgb565(220, 235, 245));
-    lcd_rect(24, 164, 272, 2, accent);
-    lcd_text("K0 TALK  K1 THEME", 24, 168, 2, rgb565(150, 170, 190));
-    lcd_text(hints_enabled ? "HINTS ON" : "HINTS OFF - HOLD K1", 24, 191, 1,
-             hints_enabled ? rgb565(245, 190, 90) : rgb565(150, 170, 190));
-    if (strcmp(status, "idle") == 0) {
-        lcd_text("K2 JOIN - VOICE TO CLOUD", 24, 212, 1, rgb565(245, 190, 90));
-    } else if (strcmp(status, "hosting") == 0) {
-        lcd_text("K2 END ACTIVITY", 24, 212, 2, rgb565(245, 190, 90));
-    } else {
-        lcd_text("K2 JOIN / END", 24, 212, 2, rgb565(150, 170, 190));
-    }
+    static const uint16_t title[] = {0x7834, 0x51b0, 0x5c0f, 0x5b50};
+    static const uint16_t boot[] = {0x542f, 0x52a8, 0x4e2d};
+    static const uint16_t connecting[] = {0x8054, 0x7f51, 0x4e2d};
+    static const uint16_t idle[] = {0x5f85, 0x673a};
+    static const uint16_t listening[] = {0x8046, 0x542c};
+    static const uint16_t thinking[] = {0x601d, 0x8003};
+    static const uint16_t speaking[] = {0x64ad, 0x62a5};
+    static const uint16_t interrupted[] = {0x5df2, 0x6253, 0x65ad};
+    static const uint16_t error[] = {0x9519, 0x8bef};
+    static const uint16_t paused[] = {0x6682, 0x505c};
+    static const uint16_t hosting[] = {0x4e3b, 0x6301, 0x4e2d};
+    static const uint16_t hint[] = {0x65b0, 0x8bdd, 0x9898};
+    static const uint16_t theme_travel[] = {0x65c5, 0x884c};
+    static const uint16_t theme_film[] = {0x7535, 0x5f71};
+    static const uint16_t theme_reading[] = {0x9605, 0x8bfb};
+    static const uint16_t theme_general[] = {0x81ea, 0x7531, 0x8bdd, 0x9898};
+    static const uint16_t talk[] = {0x8bf4, 0x8bdd};
+    static const uint16_t topic[] = {0x4e3b, 0x9898};
+    static const uint16_t join[] = {0x52a0, 0x5165};
+    static const uint16_t end[] = {0x7ed3, 0x675f};
+    static const uint16_t hint_on[] = {0x63d0, 0x793a, 0x5f00};
+    static const uint16_t hint_off[] = {0x63d0, 0x793a, 0x5173};
+    const uint16_t *label = idle;
+    size_t label_count = 2;
+    if (strcmp(status, "boot") == 0) label = boot;
+    else if (strcmp(status, "wifi_connecting") == 0) label = connecting;
+    else if (strcmp(status, "listening") == 0) label = listening;
+    else if (strcmp(status, "thinking") == 0) label = thinking;
+    else if (strcmp(status, "speaking") == 0) label = speaking;
+    else if (strcmp(status, "interrupted") == 0) { label = interrupted; label_count = 3; }
+    else if (strcmp(status, "error") == 0) label = error;
+    else if (strcmp(status, "paused") == 0) label = paused;
+    else if (strcmp(status, "hosting") == 0) { label = hosting; label_count = 3; }
+    else if (strcmp(status, "hint") == 0) { label = hint; label_count = 3; }
+    const uint16_t *theme_glyphs = theme_travel;
+    size_t theme_count = 2;
+    if (theme != NULL && strcmp(theme, "film") == 0) theme_glyphs = theme_film;
+    else if (theme != NULL && strcmp(theme, "reading") == 0) theme_glyphs = theme_reading;
+    else if (theme != NULL && strcmp(theme, "general") == 0) { theme_glyphs = theme_general; theme_count = 4; }
+    lcd_text_zh(title, 4, 24, 18, 2, rgb565(220, 235, 245));
+    lcd_text_zh(label, label_count, 24, 68, 2, accent);
+    lcd_text_zh(theme_glyphs, theme_count, 24, 108, 1, rgb565(220, 235, 245));
+    lcd_rect(24, 135, 272, 2, accent);
+    lcd_text("K0", 24, 153, 2, rgb565(150, 170, 190));
+    lcd_text_zh(talk, 2, 52, 151, 1, rgb565(150, 170, 190));
+    lcd_text("K1", 122, 153, 2, rgb565(150, 170, 190));
+    lcd_text_zh(topic, 2, 150, 151, 1, rgb565(150, 170, 190));
+    lcd_text("K2", 220, 153, 2, rgb565(245, 190, 90));
+    lcd_text_zh(strcmp(status, "hosting") == 0 ? end : join, 2, 250, 151, 1, rgb565(245, 190, 90));
+    lcd_text_zh(hints_enabled ? hint_on : hint_off, 3, 24, 202, 1,
+                hints_enabled ? rgb565(245, 190, 90) : rgb565(150, 170, 190));
     esp_err_t result = esp_lcd_panel_draw_bitmap(s_lcd_panel, 0, 0, LCD_WIDTH, LCD_HEIGHT,
                                                          s_lcd_frame);
     // draw_bitmap is asynchronous: do not redraw a buffer still owned by LCD DMA.
