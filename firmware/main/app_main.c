@@ -156,7 +156,8 @@ static void stop_audio(void)
     ESP_LOGI(TAG, "audio stopped locally at %lld us", requested_at);
 }
 
-static esp_err_t activity_command(const char *action, const char *scene, const char *theme)
+static esp_err_t activity_command(const char *action, const char *scene, const char *theme,
+                                  bool hints_enabled)
 {
     if (gateway_client_activity_pending()) return ESP_ERR_INVALID_STATE;
     if (strcmp(action, "start") == 0 && (s_capture_active || audio_player_busy()))
@@ -167,7 +168,7 @@ static esp_err_t activity_command(const char *action, const char *scene, const c
     if (strcmp(action, "hints_on") == 0 || strcmp(action, "hints_off") == 0)
         return gateway_client_activity(action, scene, theme, false);
     return gateway_client_activity(action, scene, theme,
-                                   strcmp(action, "start") == 0 && s_hint_consent);
+                                   strcmp(action, "start") == 0 ? hints_enabled : false);
 }
 
 static void capture_task(void *arg)
@@ -306,7 +307,7 @@ static void button_task(void *arg)
         if (event == 3) {
             const activity_state_t activity = gateway_client_activity_state();
             const char *action = activity == ACTIVITY_ACTIVE || activity == ACTIVITY_PAUSED ? "end" : "start";
-            if (activity_command(action, "social", THEMES[s_selected_theme]) != ESP_OK)
+            if (activity_command(action, "social", THEMES[s_selected_theme], s_hint_consent) != ESP_OK)
                 ESP_LOGW(TAG, "activity command unavailable");
             continue;
         }
@@ -464,9 +465,11 @@ static esp_err_t activity_handler(httpd_req_t *request)
     const cJSON *consent = cJSON_GetObjectItemCaseSensitive(root, "consent");
     esp_err_t result = ESP_ERR_INVALID_ARG;
     if (cJSON_IsString(action) && (strcmp(action->valuestring, "start") != 0 || cJSON_IsTrue(consent))) {
+        const cJSON *hints = cJSON_GetObjectItemCaseSensitive(root, "hints_enabled");
         result = activity_command(action->valuestring,
             cJSON_IsString(scene) ? scene->valuestring : "social",
-            cJSON_IsString(theme) ? theme->valuestring : THEMES[s_selected_theme]);
+            cJSON_IsString(theme) ? theme->valuestring : THEMES[s_selected_theme],
+            cJSON_IsTrue(hints));
     }
     cJSON_Delete(root);
     if (result != ESP_OK)
