@@ -36,6 +36,7 @@ typedef enum {
     APP_STATE_INTERRUPTED,
     APP_STATE_ERROR,
     APP_STATE_PAUSED,
+    APP_STATE_HOSTING,
 } app_state_t;
 
 static atomic_int s_state = APP_STATE_BOOT;
@@ -62,6 +63,7 @@ static const char *state_name(app_state_t state)
     case APP_STATE_INTERRUPTED: return "interrupted";
     case APP_STATE_ERROR: return "error";
     case APP_STATE_PAUSED: return "paused";
+    case APP_STATE_HOSTING: return "hosting";
     default: return "unknown";
     }
 }
@@ -97,7 +99,9 @@ static void gateway_event(gateway_event_t event)
             if (strcmp(theme, THEMES[i]) == 0) s_selected_theme = i;
         }
         if (!s_capture_active && !audio_player_busy()) {
-            set_state(gateway_client_activity_state() == ACTIVITY_PAUSED ? APP_STATE_PAUSED : APP_STATE_IDLE);
+            const activity_state_t activity = gateway_client_activity_state();
+            set_state(activity == ACTIVITY_ACTIVE ? APP_STATE_HOSTING :
+                      activity == ACTIVITY_PAUSED ? APP_STATE_PAUSED : APP_STATE_IDLE);
             board_display_status(state_name(s_state), THEMES[s_selected_theme]);
         }
     } else if (event == GATEWAY_READY) {
