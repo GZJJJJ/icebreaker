@@ -23,6 +23,7 @@
 #include "audio_player.h"
 #include "gateway_client.h"
 #include "cJSON.h"
+#include "usb_diag.h"
 
 static const char *TAG = "icebreaker";
 
@@ -690,6 +691,7 @@ void app_main(void)
     ESP_ERROR_CHECK(nvs_result);
 
     ESP_ERROR_CHECK(board_init());
+    ESP_ERROR_CHECK(usb_diag_start());
     board_display_status("boot", THEMES[s_selected_theme], s_hint_consent);
     board_mic_probe();
     ESP_ERROR_CHECK(audio_player_init(player_event));
