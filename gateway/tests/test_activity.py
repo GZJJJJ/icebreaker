@@ -69,6 +69,31 @@ async def test_hints_require_consent_and_return_suggestion(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_hint_request_id_is_echoed_for_suggestion_and_errors(monkeypatch):
+    ws, session = Socket(), Session(mock=True)
+    await event(ws, session, "activity.start", consent=True, hints_enabled=True)
+    await event(ws, session, "hint.request", silence_ms=25000, request_id=42)
+    await asyncio.sleep(0)
+    assert ws.events[-1]["event"] == "hint.suggestion"
+    assert ws.events[-1]["request_id"] == 42
+    assert ws.events[-1]["spoken"] is False
+    await event(ws, session, "activity.hints.set", enabled=False)
+    await event(ws, session, "hint.request", silence_ms=25000, request_id=43)
+    assert ws.events[-1] == {"event": "hint.error", "code": "hints_not_enabled", "request_id": 43}
+    for invalid in (True, -1, 0, 2**32, "42", []):
+        await event(ws, session, "hint.request", silence_ms=25000, request_id=invalid)
+        assert ws.events[-1]["code"] == "invalid_request_id"
+    await event(ws, session, "activity.hints.set", enabled=True)
+    async def fail(_):
+        raise RuntimeError("do not log this")
+    monkeypatch.setattr(server, "generate_hint", fail)
+    await event(ws, session, "hint.request", silence_ms=25000, request_id=44)
+    task = session.hint_task
+    await task
+    assert ws.events[-1] == {"event": "hint.error", "code": "hint_failed", "request_id": 44}
+
+
+@pytest.mark.asyncio
 async def test_hint_validation_and_busy(monkeypatch):
     ws, session = Socket(), Session(mock=True)
     await event(ws, session, "activity.start", consent=True, hints_enabled=True)

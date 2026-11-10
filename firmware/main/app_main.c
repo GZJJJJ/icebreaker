@@ -8,6 +8,7 @@
 #include "esp_check.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
@@ -24,21 +25,10 @@
 #include "gateway_client.h"
 #include "cJSON.h"
 #include "usb_diag.h"
+#include "app_state.h"
+#include "ambient_capture.h"
 
 static const char *TAG = "icebreaker";
-
-typedef enum {
-    APP_STATE_BOOT,
-    APP_STATE_WIFI_CONNECTING,
-    APP_STATE_IDLE,
-    APP_STATE_LISTENING,
-    APP_STATE_THINKING,
-    APP_STATE_SPEAKING,
-    APP_STATE_INTERRUPTED,
-    APP_STATE_ERROR,
-    APP_STATE_PAUSED,
-    APP_STATE_HOSTING,
-} app_state_t;
 
 static atomic_int s_state = APP_STATE_BOOT;
 static EventGroupHandle_t s_wifi_events;
@@ -54,6 +44,41 @@ static atomic_bool s_hint_consent;
 static const char *THEMES[] = {"travel", "film", "reading", "general"};
 static atomic_uint s_silence_ms;
 static int64_t s_last_hint_at;
+static atomic_bool s_ambient_listening;
+static atomic_uint s_ambient_segments_sent;
+static atomic_uint s_ambient_upload_failures;
+static atomic_bool s_display_dirty = true;
+static const char *state_name(app_state_t state);
+
+static void refresh_display(void) { s_display_dirty = true; }
+
+static void display_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        if (atomic_exchange(&s_display_dirty, false)) {
+            uint16_t hint[81];
+            gateway_client_copy_hint(hint);
+            const bool active = gateway_client_activity_state() == ACTIVITY_ACTIVE;
+            board_display_hint(state_name(s_state), THEMES[s_selected_theme],
+                               gateway_client_hints_enabled() || s_hint_consent, active,
+                               active && s_state == APP_STATE_HOSTING ? hint : NULL);
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+static void camera_capture_callback(const char *capture_id, const uint8_t *data, size_t length,
+                                    unsigned width, unsigned height)
+{
+    if (data == NULL || gateway_client_send_camera_snapshot(capture_id, data, length, width, height) != ESP_OK) {
+        char response[160];
+        snprintf(response, sizeof(response),
+                 "{\"event\":\"camera.capture.error\",\"code\":\"%s\",\"capture_id\":\"%.32s\"}",
+                 data == NULL ? "capture_failed" : "upload_failed", capture_id);
+        gateway_client_send_event(response);
+    }
+}
 
 static bool audio_chunk_has_voice(const int16_t *samples, size_t count)
 {
@@ -93,8 +118,7 @@ static void set_state(app_state_t state)
     }
 
     ESP_LOGI(TAG, "state: %s -> %s", state_name(previous), state_name(state));
-    board_display_status(state_name(state), THEMES[s_selected_theme],
-                         gateway_client_hints_enabled() || s_hint_consent);
+    refresh_display();
 }
 
 static void player_event(audio_player_event_t event)
@@ -104,7 +128,7 @@ static void player_event(audio_player_event_t event)
         s_audio_stopped = false;
         set_state(APP_STATE_SPEAKING);
     } else if (s_state == APP_STATE_SPEAKING) {
-        set_state(event == AUDIO_PLAYER_FINISHED ? APP_STATE_IDLE :
+        set_state(event == AUDIO_PLAYER_FINISHED ? app_resting_state(gateway_client_activity_state()) :
                   event == AUDIO_PLAYER_INTERRUPTED ? APP_STATE_INTERRUPTED : APP_STATE_ERROR);
     }
 }
@@ -119,10 +143,8 @@ static void gateway_event(gateway_event_t event)
         }
         if (!s_capture_active && !audio_player_busy()) {
             const activity_state_t activity = gateway_client_activity_state();
-            set_state(activity == ACTIVITY_ACTIVE ? APP_STATE_HOSTING :
-                      activity == ACTIVITY_PAUSED ? APP_STATE_PAUSED : APP_STATE_IDLE);
-            board_display_status(gateway_client_hint_ready() ? "hint" : state_name(s_state),
-                                 THEMES[s_selected_theme], gateway_client_hints_enabled());
+            set_state(app_resting_state(activity));
+            refresh_display();
         }
     } else if (event == GATEWAY_READY) {
         if (!s_capture_active && !audio_player_busy()) {
@@ -134,7 +156,7 @@ static void gateway_event(gateway_event_t event)
         }
     } else if (event == GATEWAY_IDLE) {
         if (!audio_player_busy() && !s_capture_requested) {
-            set_state(APP_STATE_IDLE);
+            set_state(app_resting_state(gateway_client_activity_state()));
         }
     } else {
         s_capture_cancelled = true;
@@ -149,6 +171,7 @@ static void stop_audio(void)
 
     s_capture_cancelled = true;
     s_capture_requested = false;
+    usb_diag_cancel_capture();
     gateway_client_cancel();
     s_audio_stopped = true;
     set_state(APP_STATE_INTERRUPTED);
@@ -179,40 +202,91 @@ static void capture_task(void *arg)
     const size_t out_frames = frames * TARGET_RATE / SAMPLE_RATE;
     int16_t *pcm = calloc(frames, sizeof(int16_t));
     int16_t *downsampled = calloc(out_frames, sizeof(int16_t));
+    ambient_capture_t *ambient = heap_caps_calloc(1, sizeof(*ambient),
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (pcm == NULL || downsampled == NULL) {
         free(pcm);
         free(downsampled);
+        free(ambient);
         vTaskDelete(NULL);
         return;
     }
+    if (ambient == NULL) ESP_LOGE(TAG, "ambient capture buffer unavailable");
 
     size_t captured_frames = 0;
+    char ambient_id[33] = "";
+    bool was_ambient = false;
+    unsigned warmup_chunks = 0;
     while (true) {
         if (!s_capture_active) {
-            if (gateway_client_activity_state() == ACTIVITY_ACTIVE &&
-                (gateway_client_activity_pending() || gateway_client_hint_ready())) {
-                vTaskDelay(pdMS_TO_TICKS(50));
-            } else if (gateway_client_activity_state() == ACTIVITY_ACTIVE &&
-                s_state == APP_STATE_HOSTING && !gateway_client_activity_pending() &&
-                gateway_client_hints_enabled() && board_read_audio(pcm, frames) == ESP_OK) {
-                if (audio_chunk_has_voice(pcm, frames)) {
+            char current_id[33];
+            if (ambient != NULL && !audio_player_busy() &&
+                (s_state == APP_STATE_HOSTING || s_state == APP_STATE_INTERRUPTED) &&
+                gateway_client_activity_capture_id(current_id)) {
+                if (!was_ambient || strcmp(current_id, ambient_id) != 0) {
+                    ambient_capture_reset(ambient);
+                    warmup_chunks = 3; // Drain stale RX chunks after playback; no echo cancellation yet.
                     s_silence_ms = 0;
-                    gateway_client_hint_dismiss();
+                    if (strcmp(current_id, ambient_id) != 0) s_last_hint_at = 0;
+                    memcpy(ambient_id, current_id, sizeof(ambient_id));
+                    was_ambient = true;
+                    set_state(APP_STATE_HOSTING);
                 }
-                else s_silence_ms += CHUNK_MS;
+                if (board_read_audio(pcm, frames) != ESP_OK) {
+                    s_ambient_listening = false;
+                    ambient_capture_reset(ambient);
+                    was_ambient = false;
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    continue;
+                }
+                if (s_capture_active || s_state != APP_STATE_HOSTING ||
+                    !gateway_client_activity_capture_id(current_id) ||
+                    strcmp(current_id, ambient_id) != 0) {
+                    s_ambient_listening = false;
+                    continue;
+                }
+                if (warmup_chunks > 0) { warmup_chunks--; continue; }
+                s_ambient_listening = true;
+                const bool voice = audio_chunk_has_voice(pcm, frames);
+                for (size_t i = 0; i < out_frames; ++i) {
+                    downsampled[i] = pcm[(i * SAMPLE_RATE) / TARGET_RATE];
+                }
+                const unsigned result = ambient_capture_push(ambient, downsampled, voice);
+                if (result & AMBIENT_STARTED) {
+                    gateway_client_ambient_speech(ambient_id);
+                    refresh_display();
+                }
+                if (voice) s_silence_ms = 0;
+                else if (s_silence_ms < 25000) s_silence_ms += CHUNK_MS;
+                if (result & AMBIENT_READY) {
+                    if (gateway_client_send_ambient(ambient_id, ambient->pcm,
+                        ambient->chunks * AMBIENT_CHUNK_SAMPLES * sizeof(int16_t)) != ESP_OK) {
+                        s_ambient_upload_failures++;
+                        ESP_LOGW(TAG, "ambient segment upload failed");
+                    } else {
+                        s_ambient_segments_sent++;
+                    }
+                    ambient_capture_reset(ambient);
+                }
                 const int64_t now = esp_timer_get_time();
-                if (s_silence_ms >= 25000 &&
+                if (gateway_client_hints_enabled() && s_silence_ms >= 25000 &&
                     (s_last_hint_at == 0 || now - s_last_hint_at >= 60000000LL) &&
                     gateway_client_hint_request((uint32_t)s_silence_ms) == ESP_OK) {
                     s_last_hint_at = now;
                     s_silence_ms = 0;
                 }
             } else {
+                s_ambient_listening = false;
+                if (was_ambient) ambient_capture_reset(ambient);
+                was_ambient = false;
                 s_silence_ms = 0;
                 vTaskDelay(pdMS_TO_TICKS(30));
             }
             continue;
         }
+        s_ambient_listening = false;
+        if (was_ambient) ambient_capture_reset(ambient);
+        was_ambient = false;
         if (!s_capture_requested) {
             // Only this task sends audio.end, after the final read/send has returned.
             if (!s_capture_cancelled) {
@@ -292,16 +366,28 @@ static void button_task(void *arg)
                     ESP_LOGW(TAG, "hint permission update failed");
             } else {
                 s_hint_consent = enabled;
-                board_display_status(state_name(s_state), THEMES[s_selected_theme], s_hint_consent);
+                refresh_display();
             }
             continue;
         }
         if (event == 2) {
             const activity_state_t activity = gateway_client_activity_state();
+            if (gateway_client_hint_ready()) {
+                gateway_client_hint_dismiss();
+                gateway_client_send_event("{\"event\":\"hint.dismiss\"}");
+                refresh_display();
+                continue;
+            }
+#ifdef ICEBREAKER_TEXT_UI_TEST
+            if (activity == ACTIVITY_ACTIVE) {
+                gateway_client_hint_request(25000);
+                continue;
+            }
+#endif
             if (!gateway_client_activity_pending() && activity != ACTIVITY_ACTIVE &&
                 activity != ACTIVITY_PAUSED && !s_capture_active && !audio_player_busy()) {
                 s_selected_theme = (s_selected_theme + 1) % 4;
-                board_display_status(state_name(s_state), THEMES[s_selected_theme], s_hint_consent);
+                refresh_display();
             }
             continue;
         }
@@ -402,22 +488,32 @@ static esp_err_t button_init(void)
 #endif
 
     xTaskCreate(button_task, "button_task", 3072, NULL, 10, NULL);
+#ifndef ICEBREAKER_TEXT_UI_TEST
     xTaskCreate(capture_task, "capture_task", 4096, NULL, 8, NULL);
+#else
+    (void)capture_task;
+    ESP_LOGW(TAG, "TEXT UI TEST: capture task disabled, no microphone reads/uploads");
+#endif
     xTaskCreate(activity_buttons_task, "activity_keys", 3072, NULL, 5, NULL);
+    xTaskCreate(display_task, "display", 4096, NULL, 4, NULL);
     return ESP_OK;
 }
 
 static esp_err_t health_handler(httpd_req_t *request)
 {
-    char response[320];
+    char response[448];
     const int length = snprintf(response, sizeof(response),
                                 "{\"ok\":true,\"state\":\"%s\",\"audio_stopped\":%s,"
                                 "\"capture_active\":%s,\"capture_requested\":%s,"
+                                "\"ambient_listening\":%s,\"ambient_segments_sent\":%u,"
+                                "\"ambient_upload_failures\":%u,"
                                 "\"button_presses\":%u,\"uptime_ms\":%lld}\n",
                                 state_name(s_state), s_audio_stopped ? "true" : "false",
-                                s_capture_active ? "true" : "false",
-                                s_capture_requested ? "true" : "false",
-                                (unsigned)s_button_presses, esp_timer_get_time() / 1000);
+                                 s_capture_active ? "true" : "false",
+                                 s_capture_requested ? "true" : "false",
+                                 s_ambient_listening ? "true" : "false",
+                                 (unsigned)s_ambient_segments_sent, (unsigned)s_ambient_upload_failures,
+                                 (unsigned)s_button_presses, esp_timer_get_time() / 1000);
     httpd_resp_set_type(request, "application/json");
     return httpd_resp_send(request, response, length);
 }
@@ -613,6 +709,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     }
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        usb_diag_cancel_capture();
         s_capture_cancelled = true;
         s_capture_requested = false;
         gateway_client_cancel();
@@ -691,9 +788,11 @@ void app_main(void)
     ESP_ERROR_CHECK(nvs_result);
 
     ESP_ERROR_CHECK(board_init());
-    ESP_ERROR_CHECK(usb_diag_start());
+    ESP_ERROR_CHECK(usb_diag_start(camera_capture_callback));
     board_display_status("boot", THEMES[s_selected_theme], s_hint_consent);
+#ifndef ICEBREAKER_TEXT_UI_TEST
     board_mic_probe();
+#endif
     ESP_ERROR_CHECK(audio_player_init(player_event));
     ESP_ERROR_CHECK(button_init());
 

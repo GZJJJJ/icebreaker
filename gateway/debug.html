@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Icebreaker Debug Panel</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #10141b; color: #e8edf5; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 24px; max-width: 1180px; margin-inline: auto; }
+    header { display: flex; justify-content: space-between; gap: 16px; align-items: start; margin-bottom: 20px; }
+    h1, h2, p { margin: 0; }
+    h1 { font-size: 24px; }
+    h2 { font-size: 16px; margin-bottom: 12px; }
+    .muted { color: #9aa7b8; font-size: 13px; }
+    .status { display: flex; align-items: center; gap: 8px; color: #9aa7b8; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #eab308; }
+    .dot.ok { background: #22c55e; }
+    .dot.bad { background: #ef4444; }
+    button { border: 0; border-radius: 8px; background: #2563eb; color: white; padding: 10px 14px; cursor: pointer; font: inherit; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    button.secondary { background: #293241; }
+    select { background: #111821; color: #e8edf5; border: 1px solid #2c394b; border-radius: 8px; padding: 9px; max-width: 100%; }
+    label { display: flex; align-items: center; gap: 8px; }
+    .toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    section { background: #19212d; border: 1px solid #2c394b; border-radius: 12px; padding: 16px; min-width: 0; }
+    .wide { grid-column: 1 / -1; }
+    .value { min-height: 52px; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; }
+    .empty { color: #728095; }
+    .meta { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
+    .metric { background: #111821; border-radius: 8px; padding: 10px; }
+    .metric b { display: block; font-size: 18px; margin-top: 4px; }
+    .snapshot { min-height: 180px; display: grid; place-items: center; background: #111821; border-radius: 8px; overflow: hidden; }
+    .snapshot img { display: block; max-width: 100%; max-height: 380px; }
+    .events { max-height: 210px; overflow: auto; font: 12px ui-monospace, monospace; color: #aebbd0; }
+    .event { padding: 4px 0; border-bottom: 1px solid #253142; }
+    .error { color: #fca5a5; }
+    @media (max-width: 700px) { body { padding: 14px; } header { display: block; } .status { margin-top: 12px; } .grid { grid-template-columns: 1fr; } .wide { grid-column: auto; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Icebreaker 调试面板</h1>
+      <p class="muted">仅本机可访问 · 不自动落盘 · 加入活动后自动分段转写同桌聊天，语音发送至云端 ASR；图片不送云端。</p>
+    </div>
+    <div class="status"><span id="gatewayDot" class="dot"></span><span id="gatewayStatus">正在连接 Gateway…</span></div>
+  </header>
+
+  <div class="toolbar" style="margin-bottom:14px">
+    <label>设备 <select id="device"><option value="">等待设备连接</option></select></label>
+    <label class="muted"><input id="consent" type="checkbox" aria-label="确认已获得在场人员本次拍照许可">已获得在场人员许可，同意拍摄并传到本机，仅本次有效</label>
+    <button id="capture" disabled>拍摄一次快照</button>
+    <button id="cancel" class="secondary" disabled>取消拍摄</button>
+    <button id="clear" class="secondary">清空面板</button>
+  </div>
+
+  <main class="grid">
+    <section>
+      <h2>设备连接 / Gateway 状态</h2>
+      <div id="deviceState" class="value empty">等待设备事件…</div>
+      <p class="muted">idle 仅表示云端发送结束，不代表扬声器已播完。</p>
+      <div class="meta">
+        <div class="metric"><span class="muted">ASR</span><b id="asrMs">—</b></div>
+        <div class="metric"><span class="muted">LLM 首字</span><b id="llmFirstMs">—</b></div>
+        <div class="metric"><span class="muted">总耗时</span><b id="totalMs">—</b></div>
+        <div class="metric"><span class="muted">LLM 完整</span><b id="llmMs">—</b></div>
+        <div class="metric"><span class="muted">TTS</span><b id="ttsMs">—</b></div>
+        <div class="metric"><span class="muted">发送</span><b id="sendMs">—</b></div>
+      </div>
+      <p class="muted" style="margin-top:8px">首字耗时包含在 LLM 完整耗时内；0 也可能表示未测量或未执行。</p>
+    </section>
+    <section>
+      <h2>错误</h2>
+      <div id="error" class="value empty">暂无错误</div>
+    </section>
+    <section>
+      <h2>语音识别原文</h2>
+      <div id="asr" class="value empty">等待 asr.final…</div>
+    </section>
+    <section>
+      <h2>AI 回复</h2>
+      <div id="llm" class="value empty">等待 llm.delta…</div>
+    </section>
+    <section>
+      <h2>冷场建议</h2>
+      <div id="hint" class="value empty">等待 hint.suggestion…</div>
+    </section>
+    <section>
+      <h2>同桌聊天转写（不逐句回复）</h2>
+      <div id="ambient" class="value empty">加入活动后自动监听，等待语音片段…</div>
+      <p id="ambientMeta" class="muted">未加入时不旁听；暂停或结束停止。</p>
+    </section>
+    <section>
+      <h2>摄像头快照</h2>
+      <div id="snapshot" class="snapshot"><span class="muted">尚未授权拍照</span></div>
+    </section>
+    <section class="wide">
+      <h2>事件流</h2>
+      <div id="events" class="events"></div>
+    </section>
+  </main>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    let socket;
+    let llmText = '';
+    let devices = [];
+    let selected = '';
+    let capturing = false;
+    let imageUrl = null;
+    let reconnectTimer;
+    let closed = false;
+    const metricIds = {asr:'asrMs', llm_first:'llmFirstMs', llm:'llmMs', tts:'ttsMs', send:'sendMs', total:'totalMs'};
+    const send = data => { if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(data)); };
+    const setText = (id, text) => { $(id).textContent = text || '—'; $(id).classList.toggle('empty', !text); };
+    const log = (text, error = false) => {
+      const row = document.createElement('div'); row.className = 'event' + (error ? ' error' : '');
+      row.textContent = new Date().toLocaleTimeString() + '  ' + text;
+      $('events').prepend(row);
+      while ($('events').children.length > 100) $('events').lastChild.remove();
+    };
+    const setDevice = (state) => { setText('deviceState', state); };
+    const updateControls = () => {
+      const device = devices.find(d => d.id === selected);
+      $('capture').disabled = socket?.readyState !== WebSocket.OPEN || !device?.camera || !$('consent').checked || capturing;
+      $('cancel').disabled = !capturing;
+    };
+    const reset = () => {
+      llmText = ''; capturing = false; $('consent').checked = false;
+      ['asr', 'llm', 'hint'].forEach(id => setText(id, ''));
+      setText('ambient', ''); setText('ambientMeta', '未加入时不旁听；暂停或结束停止。');
+      Object.values(metricIds).forEach(id => setText(id, '—'));
+      setText('error', '暂无错误'); $('error').classList.remove('error');
+      $('events').replaceChildren(); $('snapshot').replaceChildren();
+      if (imageUrl) URL.revokeObjectURL(imageUrl);
+      imageUrl = null;
+      const empty = document.createElement('span'); empty.className = 'muted'; empty.textContent = '尚未授权拍照';
+      $('snapshot').append(empty); updateControls();
+    };
+    const handle = message => {
+      if (message.event === 'debug.status') {
+        devices = message.devices;
+        const connected = devices.length > 0;
+        $('gatewayDot').className = 'dot ok';
+        $('gatewayStatus').textContent = connected ? 'Gateway 已连接 · 设备在线' : 'Gateway 已连接 · 等待设备';
+        $('device').replaceChildren();
+        const placeholder = new Option(connected ? '选择设备' : '等待设备连接', ''); $('device').add(placeholder);
+        devices.forEach(d => $('device').add(new Option(d.id + (d.mock ? ' · Mock' : ' · Real'), d.id)));
+        if (selected && !devices.some(d => d.id === selected)) { selected = ''; reset(); setDevice('设备已断开'); }
+        if (!selected && devices.length === 1) { selected = devices[0].id; send({event:'debug.select', device_id:selected}); }
+        $('device').value = selected;
+        const device = devices.find(d => d.id === selected);
+        if (device) setDevice(device.state + (device.camera ? ' · 支持手动快照' : ' · 快照需更新固件') +
+                             (device.ambient ? ' · 支持活动旁听' : ' · 旁听需更新固件'));
+        updateControls();
+        return;
+      }
+      if (message.event === 'debug.reset') { reset(); log('已清空：' + message.reason); return; }
+      if (message.event === 'debug.gap') { reset(); setText('error', '事件队列溢出，已清空不完整数据'); return; }
+      if (message.event === 'debug.error') { capturing = false; updateControls(); setText('error', message.code); log(message.code, true); return; }
+      if (message.event !== 'debug.event') return;
+      if (message.connection_id !== selected) return;
+      const p = message.payload || {};
+      const event = p.event;
+      if (event === 'gateway.ready') setDevice('Gateway ready' + (p.mock ? ' · Mock' : ' · Real provider'));
+      else if (event === 'session.state') {
+        setDevice(p.state || '—');
+        if (p.state === 'listening') { llmText = ''; ['asr', 'llm', 'hint'].forEach(id => setText(id, '')); Object.values(metricIds).forEach(id => setText(id, '—')); setText('error', '暂无错误'); $('error').classList.remove('error'); }
+      }
+      else if (event === 'reply.stage') setDevice('处理阶段：' + p.stage);
+      else if (event === 'asr.final') setText('asr', p.text);
+      else if (event === 'ambient.final') {
+        setText('ambient', p.text);
+        setText('ambientMeta', '最近一段 · 音频 ' + p.audio_ms + ' ms · ASR ' + p.asr_ms + ' ms · 保留 ' + p.ambient_segments + ' 段');
+      }
+      else if (event === 'ambient.speech') { setText('hint', ''); }
+      else if (event === 'ambient.gap') { setText('ambientMeta', 'ASR 处理不及：已跳过旧片段，保留最新待识别片段。'); }
+      else if (event === 'activity.state') {
+        const device = devices.find(d => d.id === selected);
+        setDevice(p.state + (p.listening_enabled && device?.ambient ? ' · 活动旁听已启用' :
+                            p.listening_enabled ? ' · 旁听需更新固件' : ' · 活动旁听已停止'));
+      }
+      else if (event === 'llm.delta') { llmText = (llmText + (p.text || '')).slice(0, 32000); setText('llm', llmText); }
+      else if (event === 'hint.suggestion') setText('hint', p.text);
+      else if (event === 'reply.metrics') {
+        const t = p.timings_ms || {};
+        for (const [key, id] of Object.entries(metricIds)) $(id).textContent = t[key] == null ? '—' : t[key] + ' ms';
+      } else if (event === 'error' || event === 'hint.error' || event === 'activity.error' || event === 'camera.capture.error' || event === 'ambient.error') {
+        setText('error', event + (p.code ? ': ' + p.code : '')); $('error').classList.add('error'); log(event + (p.code ? ': ' + p.code : ''), true);
+        if (event === 'camera.capture.error') { capturing = false; updateControls(); }
+      } else if (event === 'camera.capture.started' || event === 'camera.capture.requested') {
+        setDevice('相机采集中…'); log('camera.capture.started');
+      } else if (event === 'camera.snapshot.data') {
+        if (imageUrl) URL.revokeObjectURL(imageUrl);
+        const bytes = Uint8Array.from(atob(p.jpeg_base64), c => c.charCodeAt(0));
+        imageUrl = URL.createObjectURL(new Blob([bytes], {type:'image/jpeg'}));
+        const snapshotUrl = imageUrl;
+        const image = document.createElement('img'); image.alt = '相机快照'; image.src = imageUrl;
+        image.onerror = () => { if (imageUrl !== snapshotUrl) return; setText('error', 'JPEG 解码失败，起止标记有效不代表图片可解码'); $('snapshot').replaceChildren(); URL.revokeObjectURL(imageUrl); imageUrl = null; };
+        $('snapshot').replaceChildren(image); setDevice('快照已接收 · ' + p.size + ' bytes'); log('camera.snapshot.data');
+        capturing = false; updateControls();
+      }
+      if (event === 'asr.final') { llmText = ''; setText('llm', '等待 llm.delta…'); log('asr.final'); }
+      if (!['asr.final','llm.delta','camera.snapshot.data','camera.capture.error'].includes(event)) log(event);
+    };
+    const connect = () => {
+      const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+      socket = new WebSocket(scheme + '://' + location.host + '/debug');
+      socket.onopen = () => { $('gatewayDot').className = 'dot ok'; $('gatewayStatus').textContent = '调试通道已连接'; };
+      socket.onmessage = e => { try { handle(JSON.parse(e.data)); } catch (_) { log('invalid debug message', true); } };
+      socket.onclose = () => { reset(); devices = []; selected = ''; $('device').replaceChildren(new Option('等待设备连接', '')); setDevice('调试通道已断开'); $('gatewayDot').className = 'dot bad'; $('gatewayStatus').textContent = '调试通道已断开'; if (!closed) reconnectTimer = setTimeout(connect, 1500); };
+      socket.onerror = () => log('debug websocket error', true);
+    };
+    $('device').onchange = () => { selected = $('device').value; reset(); send({event:'debug.select', device_id:selected}); };
+    $('consent').onchange = updateControls;
+    $('capture').onclick = () => { if ($('capture').disabled) return; capturing = true; $('consent').checked = false; updateControls(); send({event:'camera.capture', consent:true}); };
+    $('cancel').onclick = () => send({event:'camera.cancel'});
+    $('clear').onclick = () => { send({event:'camera.cancel'}); reset(); send({event:'debug.select', device_id:selected}); };
+    window.addEventListener('pagehide', () => { closed = true; clearTimeout(reconnectTimer); reset(); socket?.close(); });
+    window.addEventListener('pageshow', e => { if (e.persisted) { closed = false; connect(); } });
+    connect();
+  </script>
+</body>
+</html>

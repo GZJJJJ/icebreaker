@@ -16,12 +16,17 @@ from websockets.asyncio.server import ServerConnection, serve
 
 from providers import SiliconFlowAsrProvider, SiliconFlowLlmProvider, synthesize_with_fallback
 from activity import Activity
+from debug_panel import CAMERA_MAGIC, DebugHub, process_request
 
 LOG = logging.getLogger("icebreaker.gateway")
 REPLY_TIMEOUT_SECONDS = 120
 HINT_TIMEOUT_SECONDS = 30
 MAX_CAPTURE_BYTES = 16000 * 2 * 30
 MAX_TTS_BYTES = 900 * 1024
+AMBIENT_MAGIC = b"IBAMBI1\x00"
+MAX_AMBIENT_BYTES = 16000 * 2 * 8
+AMBIENT_ASR_TIMEOUT_SECONDS = 20
+DEBUG = DebugHub()
 
 
 def load_api_key() -> str:
@@ -52,10 +57,13 @@ class Session:
     mock: bool = True
     turn: int = 0
     activity: Activity = field(default_factory=Activity)
+    ambient_task: asyncio.Task | None = None
+    ambient_pending: bytes | None = None
 
 
 async def send_json(ws: ServerConnection, event: str, **payload: Any) -> None:
     await ws.send(encode_event(event, **payload))
+    DEBUG.publish(ws, {"event": event, **payload})
 
 
 async def cancel_reply(session: Session) -> int:
@@ -73,6 +81,61 @@ async def cancel_hint(session: Session) -> None:
         session.hint_task.cancel()
         await asyncio.gather(session.hint_task, return_exceptions=True)
         session.hint_task = None
+
+
+async def cancel_ambient(session: Session) -> None:
+    session.ambient_pending = None
+    if session.ambient_task is not None:
+        session.ambient_task.cancel()
+        await asyncio.gather(session.ambient_task, return_exceptions=True)
+        session.ambient_task = None
+
+
+async def run_ambient(ws: ServerConnection, session: Session, pcm: bytes) -> None:
+    activity = session.activity
+    activity_id = activity.activity_id
+    while pcm is not None:
+        started = time.perf_counter()
+        try:
+            async with asyncio.timeout(AMBIENT_ASR_TIMEOUT_SECONDS):
+                if session.mock:
+                    text = "这是同桌聊天的 Mock 转写。"
+                else:
+                    text = await SiliconFlowAsrProvider(
+                        load_api_key(), os.getenv("SILICONFLOW_ASR_MODEL", "FunAudioLLM/SenseVoiceSmall")
+                    ).transcribe(pcm)
+            if (session.activity is not activity or activity.state != "active" or
+                    activity.activity_id != activity_id):
+                return
+            activity.remember_ambient(text)
+            await send_json(ws, "ambient.final", text=text.strip()[:500],
+                            asr_ms=round((time.perf_counter() - started) * 1000),
+                            audio_ms=len(pcm) * 1000 // 32000,
+                            ambient_segments=len(activity.ambient))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            code = "asr_timeout" if isinstance(exc, TimeoutError) else "asr_failed"
+            await send_json(ws, "ambient.error", code=code)
+        pcm, session.ambient_pending = session.ambient_pending, None
+
+
+async def accept_ambient(ws: ServerConnection, session: Session, packet: bytes) -> None:
+    if session.activity.state != "active" or session.state not in {"idle", "interrupted"}:
+        return
+    if len(packet) < 40 or packet[8:40] != session.activity.activity_id.encode("ascii"):
+        return
+    pcm = packet[40:]
+    if not 12800 <= len(pcm) <= MAX_AMBIENT_BYTES or len(pcm) % 2:
+        await send_json(ws, "ambient.error", code="invalid_audio")
+        return
+    await cancel_hint(session)
+    if session.ambient_task is not None and not session.ambient_task.done():
+        if session.ambient_pending is not None:
+            await send_json(ws, "ambient.gap", code="asr_backlog")
+        session.ambient_pending = pcm
+    else:
+        session.ambient_task = asyncio.create_task(run_ambient(ws, session, pcm))
 
 
 async def generate_hint(session: Session) -> str:
@@ -96,22 +159,26 @@ async def generate_hint(session: Session) -> str:
     return response.strip()[:80]
 
 
-async def run_hint(ws: ServerConnection, session: Session, silence_ms: int) -> None:
+async def run_hint(ws: ServerConnection, session: Session, silence_ms: int,
+                   request_id: int | None = None) -> None:
+    correlation = {} if request_id is None else {"request_id": request_id}
     try:
         async with asyncio.timeout(HINT_TIMEOUT_SECONDS):
+            if session.ambient_task is not None:
+                await asyncio.shield(session.ambient_task)
             suggestion = await generate_hint(session)
             if not suggestion:
-                await send_json(ws, "hint.error", code="empty_hint")
+                await send_json(ws, "hint.error", code="empty_hint", **correlation)
                 return
             await send_json(ws, "hint.suggestion", text=suggestion[:200], silence_ms=silence_ms,
-                            spoken=False)
+                             spoken=False, **correlation)
     except asyncio.CancelledError:
         raise
     except TimeoutError:
-        await send_json(ws, "hint.error", code="hint_timeout")
+        await send_json(ws, "hint.error", code="hint_timeout", **correlation)
     except Exception as exc:
         LOG.warning("hint failed (%s)", type(exc).__name__)
-        await send_json(ws, "hint.error", code="hint_failed")
+        await send_json(ws, "hint.error", code="hint_failed", **correlation)
     finally:
         session.hint_task = None
 
@@ -237,7 +304,12 @@ async def append_audio(ws: ServerConnection, session: Session, pcm: bytes) -> No
 
 async def handle_message(ws: ServerConnection, session: Session, message: str | bytes) -> None:
     if isinstance(message, bytes):
-        await append_audio(ws, session, message)
+        if message.startswith(CAMERA_MAGIC):
+            DEBUG.snapshot(ws, message)
+        elif message.startswith(AMBIENT_MAGIC):
+            await accept_ambient(ws, session, message)
+        else:
+            await append_audio(ws, session, message)
         return
 
     try:
@@ -251,6 +323,9 @@ async def handle_message(ws: ServerConnection, session: Session, message: str | 
         return
 
     event = request.get("event")
+    if event in {"device.ready", "camera.capture.started", "camera.capture.error", "camera.snapshot"}:
+        DEBUG.incoming(ws, request)
+        return
     if event == "activity.start":
         try:
             activity = Activity.from_request(request)
@@ -259,6 +334,7 @@ async def handle_message(ws: ServerConnection, session: Session, message: str | 
             return
         await cancel_reply(session)
         await cancel_hint(session)
+        await cancel_ambient(session)
         session.activity.end()
         session.activity = activity
         session.state = "idle"
@@ -273,10 +349,12 @@ async def handle_message(ws: ServerConnection, session: Session, message: str | 
             return
         await cancel_reply(session)
         await cancel_hint(session)
+        await cancel_ambient(session)
         if event == "activity.end":
             session.activity.end()
         else:
             session.activity.state = "paused" if event == "activity.pause" else "active"
+            session.activity.renew_capture_id()
         session.state = "idle"
         await send_json(ws, "activity.state", **session.activity.snapshot())
     elif event == "activity.hints.set":
@@ -292,6 +370,7 @@ async def handle_message(ws: ServerConnection, session: Session, message: str | 
             return
         cancel_ms = await cancel_reply(session)
         await cancel_hint(session)
+        await cancel_ambient(session)
         session.turn += 1
         session.state = "listening"
         LOG.info("turn.start connection=%x turn=%d cancel_ms=%d", id(session), session.turn, cancel_ms)
@@ -324,27 +403,39 @@ async def handle_message(ws: ServerConnection, session: Session, message: str | 
     elif event == "session.interrupt":
         cancel_ms = await cancel_reply(session)
         await cancel_hint(session)
+        await cancel_ambient(session)
         session.state = "interrupted"
         LOG.info("turn.interrupt connection=%x turn=%d cancel_ms=%d", id(session), session.turn, cancel_ms)
         await send_json(ws, "session.state", state=session.state, cancel_ms=cancel_ms)
     elif event == "session.end":
         await cancel_reply(session)
         await cancel_hint(session)
+        await cancel_ambient(session)
         session.activity.end()
         session.state = "ended"
         await send_json(ws, "session.state", state=session.state)
     elif event == "hint.request":
         silence_ms = request.get("silence_ms")
+        request_id = request.get("request_id")
+        if request_id is not None and (type(request_id) is not int or not 1 <= request_id <= 0xffffffff):
+            await send_json(ws, "hint.error", code="invalid_request_id")
+            return
+        correlation = {} if request_id is None else {"request_id": request_id}
         if session.activity.state != "active" or not session.activity.hints_enabled:
-            await send_json(ws, "hint.error", code="hints_not_enabled")
+            await send_json(ws, "hint.error", code="hints_not_enabled", **correlation)
         elif not isinstance(silence_ms, int) or silence_ms < 0 or silence_ms > 3600000:
-            await send_json(ws, "hint.error", code="invalid_silence")
-        elif session.reply_task is not None or session.hint_task is not None:
-            await send_json(ws, "hint.error", code="busy")
+            await send_json(ws, "hint.error", code="invalid_silence", **correlation)
+        elif (session.reply_task is not None and not session.reply_task.done()) or session.hint_task is not None:
+            await send_json(ws, "hint.error", code="busy", **correlation)
         else:
-            session.hint_task = asyncio.create_task(run_hint(ws, session, silence_ms))
+            session.hint_task = asyncio.create_task(run_hint(ws, session, silence_ms, request_id))
     elif event == "hint.dismiss":
         await cancel_hint(session)
+    elif event == "ambient.speech":
+        if (session.activity.state == "active" and
+                request.get("activity_id") == session.activity.activity_id):
+            await cancel_hint(session)
+            await send_json(ws, "ambient.speech")
     else:
         await send_json(ws, "error", code="unknown_event", received_event=event)
 
@@ -352,18 +443,28 @@ async def handle_message(ws: ServerConnection, session: Session, message: str | 
 async def connection_handler(ws: ServerConnection) -> None:
     session = Session()
     session.mock = os.getenv("ICEBREAKER_MOCK", "1").lower() not in {"0", "false", "no"}
-    await send_json(ws, "gateway.ready", protocol=1, mock=session.mock)
+    DEBUG.register(ws, session.mock)
     try:
+        await send_json(ws, "gateway.ready", protocol=1, mock=session.mock)
         async for message in ws:
             await handle_message(ws, session, message)
     finally:
         await cancel_reply(session)
         await cancel_hint(session)
+        await cancel_ambient(session)
         session.activity.end()
+        DEBUG.unregister(ws)
+
+
+async def route_connection(ws: ServerConnection) -> None:
+    if ws.request is not None and ws.request.path.split("?", 1)[0] == "/debug":
+        await DEBUG.handle_viewer(ws)
+    else:
+        await connection_handler(ws)
 
 
 async def run(host: str, port: int) -> None:
-    async with serve(connection_handler, host, port):
+    async with serve(route_connection, host, port, process_request=process_request):
         LOG.info("Gateway listening on ws://%s:%d", host, port)
         await asyncio.Future()
 

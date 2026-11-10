@@ -8,6 +8,8 @@
 
 esp_err_t board_init(void);
 esp_err_t board_display_status(const char *status, const char *theme, bool hints_enabled);
+esp_err_t board_display_hint(const char *status, const char *theme, bool hints_enabled,
+                             bool activity_active, const uint16_t *hint);
 esp_err_t board_read_activity_buttons(uint8_t *buttons);
 void board_stop_audio(void);
 esp_err_t board_start_audio(void);

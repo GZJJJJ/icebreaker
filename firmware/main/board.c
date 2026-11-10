@@ -1,6 +1,7 @@
 #include "board.h"
 #include "board_audio_control.h"
 #include "board_font.h"
+#include "display_text.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -350,6 +351,33 @@ static esp_err_t lcd_init(void)
 
 esp_err_t board_display_status(const char *status, const char *theme, bool hints_enabled)
 {
+    return board_display_hint(status, theme, hints_enabled, false, NULL);
+}
+
+extern const uint8_t display_font[] asm("_binary_icebreaker_text16_bin_start");
+
+static void lcd_dynamic_glyph(uint16_t code, int x, int y, void *context)
+{
+    const uint16_t color = *(const uint16_t *)context;
+    const uint8_t *glyph = display_font + display_glyph_index(code) * 32;
+    for (int row = 0; row < 16; ++row) {
+        const uint16_t bits = ((uint16_t)glyph[row * 2] << 8) | glyph[row * 2 + 1];
+        for (int column = 0; column < 16; ++column) {
+            if (bits & (1u << (15 - column))) lcd_rect(x + column, y + row, 1, 1, color);
+        }
+    }
+}
+
+static void lcd_dynamic_text(const char *text, int x, int y, uint16_t color)
+{
+    uint16_t codes[DISPLAY_TEXT_MAX + 1];
+    display_text_decode(codes, text);
+    display_text_layout(codes, x, y, LCD_WIDTH - x, 1, lcd_dynamic_glyph, &color);
+}
+
+esp_err_t board_display_hint(const char *status, const char *theme, bool hints_enabled,
+                             bool activity_active, const uint16_t *hint_text)
+{
     if (s_lcd_panel == NULL || s_lcd_mutex == NULL || s_lcd_frame == NULL || status == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -381,7 +409,10 @@ esp_err_t board_display_status(const char *status, const char *theme, bool hints
     }
     const uint16_t background = rgb565(10, 18, 32);
     lcd_fill(background);
-    lcd_rect(0, 0, LCD_WIDTH, 10, accent);
+    const bool has_hint = activity_active && hints_enabled && hint_text != NULL && hint_text[0];
+    if (has_hint) accent = rgb565(255, 210, 70);
+    lcd_rect(0, 0, LCD_WIDTH, 4, accent);
+    lcd_rect(12, 42, 296, 144, rgb565(22, 36, 55));
     static const uint16_t title[] = {0x7834, 0x51b0, 0x5c0f, 0x5b50};
     static const uint16_t boot[] = {0x542f, 0x52a8, 0x4e2d};
     static const uint16_t connecting[] = {0x8054, 0x7f51, 0x4e2d};
@@ -402,12 +433,10 @@ esp_err_t board_display_status(const char *status, const char *theme, bool hints
     static const uint16_t topic[] = {0x4e3b, 0x9898};
     static const uint16_t join[] = {0x52a0, 0x5165};
     static const uint16_t end[] = {0x7ed3, 0x675f};
-    static const uint16_t hint_on[] = {0x63d0, 0x793a, 0x5f00};
-    static const uint16_t hint_off[] = {0x63d0, 0x793a, 0x5173};
     const uint16_t *label = idle;
     size_t label_count = 2;
-    if (strcmp(status, "boot") == 0) label = boot;
-    else if (strcmp(status, "wifi_connecting") == 0) label = connecting;
+    if (strcmp(status, "boot") == 0) { label = boot; label_count = 3; }
+    else if (strcmp(status, "wifi_connecting") == 0) { label = connecting; label_count = 3; }
     else if (strcmp(status, "listening") == 0) label = listening;
     else if (strcmp(status, "thinking") == 0) label = thinking;
     else if (strcmp(status, "speaking") == 0) label = speaking;
@@ -421,18 +450,39 @@ esp_err_t board_display_status(const char *status, const char *theme, bool hints
     if (theme != NULL && strcmp(theme, "film") == 0) theme_glyphs = theme_film;
     else if (theme != NULL && strcmp(theme, "reading") == 0) theme_glyphs = theme_reading;
     else if (theme != NULL && strcmp(theme, "general") == 0) { theme_glyphs = theme_general; theme_count = 4; }
-    lcd_text_zh(title, 4, 24, 18, 2, rgb565(220, 235, 245));
-    lcd_text_zh(label, label_count, 24, 68, 2, accent);
-    lcd_text_zh(theme_glyphs, theme_count, 24, 108, 1, rgb565(220, 235, 245));
-    lcd_rect(24, 135, 272, 2, accent);
-    lcd_text("K0", 24, 153, 2, rgb565(150, 170, 190));
-    lcd_text_zh(talk, 2, 52, 151, 1, rgb565(150, 170, 190));
-    lcd_text("K1", 122, 153, 2, rgb565(150, 170, 190));
-    lcd_text_zh(topic, 2, 150, 151, 1, rgb565(150, 170, 190));
-    lcd_text("K2", 220, 153, 2, rgb565(245, 190, 90));
-    lcd_text_zh(strcmp(status, "hosting") == 0 ? end : join, 2, 250, 151, 1, rgb565(245, 190, 90));
-    lcd_text_zh(hints_enabled ? hint_on : hint_off, 3, 24, 202, 1,
-                hints_enabled ? rgb565(245, 190, 90) : rgb565(150, 170, 190));
+    lcd_text_zh(title, 4, 16, 12, 1, rgb565(220, 235, 245));
+    lcd_text_zh(theme_glyphs, theme_count, 232, 12, 1, rgb565(150, 170, 190));
+    if (has_hint) {
+        lcd_dynamic_text("新话题 · 仅文字提示", 24, 49, accent);
+        uint16_t foreground = rgb565(241, 245, 250);
+        display_text_layout(hint_text, 24, 77, 272, 5, lcd_dynamic_glyph, &foreground);
+    } else {
+        lcd_text_zh(label, label_count, 24, 60, 2, accent);
+        lcd_dynamic_text(strcmp(status, "hosting") == 0 ? "你们自由聊，我在旁边。" :
+                         strcmp(status, "paused") == 0 ? "活动已暂停，语音上传已停止" :
+                         strcmp(status, "error") == 0 ? "暂时遇到问题，请检查连接" :
+                         strcmp(status, "thinking") == 0 ? "正在处理，请稍候" :
+                         strcmp(status, "speaking") == 0 ? "按 K0 可立即打断" :
+                         "加入前请告知语音云端处理", 24, 107, rgb565(220, 235, 245));
+        lcd_dynamic_text(hints_enabled ? "轻提示已开启 · 长按 K1 关闭" : "轻提示已关闭 · 长按 K1 开启",
+                         24, 157, rgb565(150, 170, 190));
+    }
+#ifdef ICEBREAKER_TEXT_UI_TEST
+    lcd_dynamic_text("文字验收 · 不采音、不播音", 16, 193, rgb565(182, 196, 212));
+#else
+    lcd_dynamic_text(activity_active && strcmp(status, "hosting") == 0 ? "聆听中 · 语音上传云端" :
+                     activity_active ? "旁听暂时停止" : "未加入或已暂停 · 不旁听",
+                      16, 193, rgb565(182, 196, 212));
+#endif
+    lcd_text("K0", 16, 220, 1, rgb565(150, 170, 190));
+    lcd_text_zh(talk, 2, 36, 217, 1, rgb565(150, 170, 190));
+    lcd_text("K1", 116, 220, 1, rgb565(150, 170, 190));
+    if (has_hint) lcd_dynamic_text("收起", 136, 217, accent);
+    else if (activity_active) lcd_dynamic_text("长按", 136, 217, rgb565(150, 170, 190));
+    else lcd_text_zh(topic, 2, 136, 217, 1, rgb565(150, 170, 190));
+    lcd_text("K2", 225, 220, 1, rgb565(245, 190, 90));
+    lcd_text_zh(activity_active || strcmp(status, "paused") == 0 ? end : join,
+                2, 245, 217, 1, rgb565(150, 170, 190));
     esp_err_t result = esp_lcd_panel_draw_bitmap(s_lcd_panel, 0, 0, LCD_WIDTH, LCD_HEIGHT,
                                                          s_lcd_frame);
     // draw_bitmap is asynchronous: do not redraw a buffer still owned by LCD DMA.

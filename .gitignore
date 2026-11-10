@@ -5,6 +5,7 @@ eim_config.toml
 .env
 .env.*
 .mimosa/
+.openchamber/
 
 # Local credentials, captures and generated reports
 *.log

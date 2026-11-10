@@ -14,6 +14,8 @@
 #include "freertos/semphr.h"
 #include "audio_player.h"
 #include "board.h"
+#include "usb_diag.h"
+#include "hint_state.h"
 
 static const char *TAG = "gateway";
 static esp_websocket_client_handle_t s_client;
@@ -23,11 +25,11 @@ static atomic_int s_activity_state = ACTIVITY_NONE;
 static atomic_bool s_activity_pending;
 static atomic_int s_activity_theme;
 static atomic_bool s_hints_enabled;
+static char s_activity_id[33];
 static const char *THEMES[] = {"travel", "film", "reading", "general"};
 static const char *s_activity_scene = "social";
 static unsigned s_history_turns;
-static atomic_bool s_hint_pending;
-static atomic_bool s_hint_ready;
+static hint_state_t s_hint;
 static SemaphoreHandle_t s_gate;
 static void (*s_callback)(gateway_event_t event);
 static unsigned s_turn;
@@ -134,6 +136,7 @@ static bool tts_buffer_append(const uint8_t *data, size_t length)
 
 static void cancel_locked(void)
 {
+    hint_state_clear(&s_hint);
     s_accept_reply = false;
     s_awaiting_start = false;
     s_upload_enabled = false;
@@ -192,9 +195,13 @@ static void handle_json(cJSON *root)
         s_activity_pending = false;
         s_history_turns = 0;
         s_hints_enabled = false;
-        s_hint_pending = false;
-        s_hint_ready = false;
+        hint_state_clear(&s_hint);
         s_reply_stage = "idle";
+#ifdef ICEBREAKER_TEXT_UI_TEST
+        gateway_client_send_event("{\"event\":\"device.ready\",\"camera_capture\":true,\"ambient_context\":false,\"text_ui_test\":true}");
+#else
+        gateway_client_send_event("{\"event\":\"device.ready\",\"camera_capture\":true,\"ambient_context\":true}");
+#endif
         notify(GATEWAY_READY);
         return;
     }
@@ -223,26 +230,58 @@ static void handle_json(cJSON *root)
         s_history_turns = cJSON_IsNumber(history) && history->valueint >= 0 ? history->valueint : 0;
         const cJSON *hints = cJSON_GetObjectItemCaseSensitive(root, "hints_enabled");
         s_hints_enabled = cJSON_IsTrue(hints);
+        const cJSON *activity_id = cJSON_GetObjectItemCaseSensitive(root, "activity_id");
+        s_activity_id[0] = '\0';
+        if (cJSON_IsString(activity_id) && strlen(activity_id->valuestring) == 32 &&
+            strspn(activity_id->valuestring, "0123456789abcdef") == 32) {
+            memcpy(s_activity_id, activity_id->valuestring, sizeof(s_activity_id));
+        }
         s_activity_pending = false;
-        s_hint_ready = false;
+        hint_state_clear(&s_hint);
         s_reply_stage = "idle";
+        if (s_activity_state == ACTIVITY_PAUSED || s_activity_state == ACTIVITY_ENDED)
+            usb_diag_cancel_capture();
         notify(GATEWAY_ACTIVITY_CHANGED);
         return;
     }
     if (strcmp(name->valuestring, "hint.suggestion") == 0) {
-        s_hint_pending = false;
-        s_hint_ready = true;
-        s_reply_stage = "hint_ready";
+        if (s_activity_state != ACTIVITY_ACTIVE || !s_hints_enabled || s_activity_pending) return;
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "request_id");
         const cJSON *suggestion = cJSON_GetObjectItemCaseSensitive(root, "text");
-        if (cJSON_IsString(suggestion)) {
-            ESP_LOGI(TAG, "topic suggestion ready (%u chars)",
-                     (unsigned)strlen(suggestion->valuestring));
-        }
+        if (!cJSON_IsNumber(id) || id->valuedouble != s_hint.request_id ||
+            !cJSON_IsString(suggestion)) return;
+        if (!hint_state_accept(&s_hint, s_hint.request_id, suggestion->valuestring)) return;
+        s_reply_stage = "hint_ready";
         notify(GATEWAY_ACTIVITY_CHANGED);
         return;
     }
     if (strcmp(name->valuestring, "hint.error") == 0) {
-        s_hint_pending = false;
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "request_id");
+        if (cJSON_IsNumber(id) && id->valuedouble == s_hint.request_id) s_hint.pending = false;
+        return;
+    }
+    if (strcmp(name->valuestring, "ambient.speech") == 0) {
+        hint_state_clear(&s_hint);
+        notify(GATEWAY_ACTIVITY_CHANGED);
+        return;
+    }
+    if (strcmp(name->valuestring, "camera.capture") == 0) {
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "capture_id");
+        const cJSON *consent = cJSON_GetObjectItemCaseSensitive(root, "consent");
+        if (!cJSON_IsTrue(consent) || !cJSON_IsString(id)) return;
+        if (usb_diag_request_capture(id->valuestring) == ESP_OK) {
+            char response[128];
+            snprintf(response, sizeof(response), "{\"event\":\"camera.capture.started\",\"capture_id\":\"%.32s\"}", id->valuestring);
+            gateway_client_send_event(response);
+        } else if (strlen(id->valuestring) == 32 && strspn(id->valuestring, "0123456789abcdef") == 32) {
+            char response[128];
+            snprintf(response, sizeof(response), "{\"event\":\"camera.capture.error\",\"code\":\"busy\",\"capture_id\":\"%.32s\"}", id->valuestring);
+            gateway_client_send_event(response);
+        }
+        return;
+    }
+    if (strcmp(name->valuestring, "camera.cancel") == 0) {
+        usb_diag_cancel_capture();
         return;
     }
     if (strcmp(name->valuestring, "activity.error") == 0) {
@@ -252,6 +291,8 @@ static void handle_json(cJSON *root)
         return;
     }
     if (strcmp(name->valuestring, "session.state") == 0 && cJSON_IsString(state)) {
+        if (strcmp(state->valuestring, "interrupted") == 0 || strcmp(state->valuestring, "ended") == 0)
+            usb_diag_cancel_capture();
         const cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "session_id");
         if (strcmp(state->valuestring, "listening") == 0 && s_awaiting_start &&
             cJSON_IsString(id) && strcmp(id->valuestring, s_session_id) == 0) {
@@ -385,8 +426,8 @@ static void gateway_event_handler(void *arg, esp_event_base_t event_base,
         s_activity_state = ACTIVITY_NONE;
         s_activity_pending = false;
         s_history_turns = 0;
-        s_hint_pending = false;
-        s_hint_ready = false;
+        hint_state_clear(&s_hint);
+        usb_diag_cancel_capture();
         gateway_client_cancel();
         notify(GATEWAY_DISCONNECTED);
         ESP_LOGW(TAG, "disconnected; client will reconnect");
@@ -505,22 +546,86 @@ esp_err_t gateway_client_begin_turn(void)
 activity_state_t gateway_client_activity_state(void) { return s_activity_state; }
 bool gateway_client_activity_pending(void) { return s_activity_pending; }
 const char *gateway_client_activity_theme(void) { return THEMES[s_activity_theme]; }
-bool gateway_client_hint_ready(void) { return s_hint_ready; }
-void gateway_client_hint_dismiss(void) { s_hint_ready = false; }
+bool gateway_client_hint_ready(void)
+{
+    if (s_gate == NULL) return false;
+    xSemaphoreTake(s_gate, portMAX_DELAY);
+    const bool ready = hint_state_ready(&s_hint);
+    xSemaphoreGive(s_gate);
+    return ready;
+}
+
+void gateway_client_copy_hint(uint16_t text[81])
+{
+    text[0] = 0;
+    if (s_gate == NULL) return;
+    xSemaphoreTake(s_gate, portMAX_DELAY);
+    memcpy(text, s_hint.text, sizeof(s_hint.text));
+    xSemaphoreGive(s_gate);
+}
+
+void gateway_client_hint_dismiss(void)
+{
+    if (s_gate == NULL) return;
+    xSemaphoreTake(s_gate, portMAX_DELAY);
+    hint_state_clear(&s_hint);
+    xSemaphoreGive(s_gate);
+    notify(GATEWAY_ACTIVITY_CHANGED);
+}
 bool gateway_client_hints_enabled(void) { return s_hints_enabled; }
+
+bool gateway_client_activity_capture_id(char id[33])
+{
+    if (s_gate == NULL) return false;
+    xSemaphoreTake(s_gate, portMAX_DELAY);
+    const bool active = s_connected && s_activity_state == ACTIVITY_ACTIVE &&
+                        !s_activity_pending && s_activity_id[0] != '\0';
+    if (active) memcpy(id, s_activity_id, sizeof(s_activity_id));
+    xSemaphoreGive(s_gate);
+    return active;
+}
+
+esp_err_t gateway_client_ambient_speech(const char *activity_id)
+{
+    gateway_client_hint_dismiss();
+    char request[96];
+    snprintf(request, sizeof(request), "{\"event\":\"ambient.speech\",\"activity_id\":\"%.32s\"}", activity_id);
+    return gateway_client_send_event(request);
+}
+
+esp_err_t gateway_client_send_ambient(const char *activity_id, const void *data, size_t length)
+{
+    char current[33];
+    if (data == NULL || length < 12800 || length > 16000 * 2 * 8 || length % 2 ||
+        !gateway_client_activity_capture_id(current) || strcmp(current, activity_id) != 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    uint8_t *packet = heap_caps_malloc(length + 40, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (packet == NULL) return ESP_ERR_NO_MEM;
+    memcpy(packet, "IBAMBI1\0", 8);
+    memcpy(packet + 8, activity_id, 32);
+    memcpy(packet + 40, data, length);
+    const int sent = esp_websocket_client_send_bin(s_client, (const char *)packet,
+                                                   length + 40, pdMS_TO_TICKS(1000));
+    free(packet);
+    return sent == (int)(length + 40) ? ESP_OK : ESP_FAIL;
+}
 
 esp_err_t gateway_client_hint_request(uint32_t silence_ms)
 {
+    xSemaphoreTake(s_gate, portMAX_DELAY);
     if (!s_connected || s_activity_state != ACTIVITY_ACTIVE || !s_hints_enabled || s_activity_pending ||
-        s_hint_pending || s_hint_ready || audio_player_busy()) {
+        s_hint.pending || hint_state_ready(&s_hint) || audio_player_busy()) {
+        xSemaphoreGive(s_gate);
         return ESP_ERR_INVALID_STATE;
     }
     char request[96];
     snprintf(request, sizeof(request),
-        "{\"event\":\"hint.request\",\"silence_ms\":%u}", (unsigned)silence_ms);
-    s_hint_pending = true;
+        "{\"event\":\"hint.request\",\"silence_ms\":%u,\"request_id\":%u}",
+        (unsigned)silence_ms, (unsigned)hint_state_request(&s_hint));
+    xSemaphoreGive(s_gate);
     const esp_err_t result = gateway_client_send_event(request);
-    if (result != ESP_OK) s_hint_pending = false;
+    if (result != ESP_OK) gateway_client_hint_dismiss();
     return result;
 }
 
@@ -534,7 +639,7 @@ int gateway_client_activity_stats(char *buffer, size_t size)
         states[s_activity_state], s_activity_pending ? "true" : "false", s_activity_scene,
         THEMES[s_activity_theme], s_history_turns,
         (s_activity_state == ACTIVITY_ACTIVE || s_activity_state == ACTIVITY_PAUSED) && s_hints_enabled ? "true" : "false",
-        s_hint_ready ? "true" : "false");
+        hint_state_ready(&s_hint) ? "true" : "false");
     xSemaphoreGive(s_gate);
     return length;
 }
@@ -563,6 +668,7 @@ esp_err_t gateway_client_activity(const char *action, const char *scene, const c
         return ESP_ERR_INVALID_ARG;
     }
     s_activity_pending = true;
+    gateway_client_hint_dismiss();
     const esp_err_t result = gateway_client_send_event(request);
     if (result != ESP_OK) s_activity_pending = false;
     return result;
@@ -589,6 +695,31 @@ esp_err_t gateway_client_send_event(const char *event_json)
     const int sent = esp_websocket_client_send_text(s_client, event_json,
                                                     strlen(event_json), pdMS_TO_TICKS(100));
     return sent == strlen(event_json) ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t gateway_client_send_camera_snapshot(const char *capture_id, const uint8_t *data, size_t length,
+                                              unsigned width, unsigned height)
+{
+    if (!s_connected || data == NULL || length == 0 || length > 128 * 1024 ||
+        capture_id == NULL || strlen(capture_id) != 32) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    char metadata[192];
+    const int metadata_length = snprintf(metadata, sizeof(metadata),
+        "{\"event\":\"camera.snapshot\",\"size\":%u,\"width\":%u,\"height\":%u,\"capture_id\":\"%.32s\"}",
+        (unsigned)length, width, height, capture_id);
+    if (metadata_length <= 0 || metadata_length >= (int)sizeof(metadata) ||
+        gateway_client_send_event(metadata) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    uint8_t *packet = heap_caps_malloc(length + 40, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (packet == NULL) return ESP_ERR_NO_MEM;
+    memcpy(packet, "IBJPEG1\0", 8);
+    memcpy(packet + 8, capture_id, 32);
+    memcpy(packet + 40, data, length);
+    const int sent = esp_websocket_client_send_bin(s_client, (const char *)packet, length + 40, pdMS_TO_TICKS(1000));
+    free(packet);
+    return sent == (int)(length + 40) ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t gateway_client_send_audio(const void *data, size_t length)

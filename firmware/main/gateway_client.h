@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 
@@ -38,7 +39,13 @@ void gateway_client_playback_started(void);
 esp_err_t gateway_client_hint_request(uint32_t silence_ms);
 bool gateway_client_hint_ready(void);
 void gateway_client_hint_dismiss(void);
+void gateway_client_copy_hint(uint16_t text[81]);
 bool gateway_client_hints_enabled(void);
+bool gateway_client_activity_capture_id(char id[33]);
+esp_err_t gateway_client_ambient_speech(const char *activity_id);
+esp_err_t gateway_client_send_ambient(const char *activity_id, const void *data, size_t length);
 esp_err_t gateway_client_send_event(const char *event_json);
 esp_err_t gateway_client_send_audio(const void *data, size_t length);
+esp_err_t gateway_client_send_camera_snapshot(const char *capture_id, const uint8_t *data, size_t length,
+                                              unsigned width, unsigned height);
 int gateway_client_stats(char *buffer, size_t size);

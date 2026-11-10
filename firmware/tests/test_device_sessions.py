@@ -112,9 +112,11 @@ async def run(url):
             assert playing["xio_output"] == 0xA4
             if interrupt:
                 await button()
-                await state("interrupted")
+                activity = await get("/api/activity")
+                await state("hosting" if activity["state"] == "active" else "interrupted")
             else:
-                await state("idle")
+                activity = await get("/api/activity")
+                await state("hosting" if activity["state"] == "active" else "idle")
             await wait_for("/api/stats", lambda data: not data["player_busy"])
             done = await get("/api/stats")
             assert done["xio_output"] == 0x84
@@ -164,7 +166,9 @@ async def run(url):
             activity = await wait_for("/api/activity", lambda data: data["state"] == "active")
             assert activity["theme"] == "film"
             assert not activity["camera_enabled"] and not activity["hints_enabled"]
+            await wait_for("/health", lambda data: data["ambient_listening"])
             await turn()
+            await wait_for("/health", lambda data: data["ambient_listening"])
             await wait_for("/api/activity", lambda data: data["history_turns"] == 1)
             await turn(interrupt=True)
             activity = await get("/api/activity")
@@ -172,16 +176,18 @@ async def run(url):
             response = await client.post("/api/activity", json={"action": "pause"})
             response.raise_for_status()
             await state("paused")
+            await wait_for("/health", lambda data: not data["ambient_listening"])
             await button()
             assert not (await get("/health"))["capture_requested"]
             response = await client.post("/api/activity", json={"action": "resume"})
             response.raise_for_status()
-            await state("idle")
+            await state("hosting")
             await turn()
             await wait_for("/api/activity", lambda data: data["history_turns"] == 3)
             await button(2)
             ended = await wait_for("/api/activity", lambda data: data["state"] == "ended")
             assert ended["history_turns"] == 0
+            await wait_for("/health", lambda data: not data["ambient_listening"])
             await button()
             assert not (await get("/health"))["capture_requested"]
             assert (await client.post("/api/activity", json={"action": "start"})).status_code == 400
